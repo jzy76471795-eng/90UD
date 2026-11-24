@@ -1,0 +1,67 @@
+<Project Sdk="Microsoft.NET.Sdk">
+ <PropertyGroup>
+  <OutputType>WinExe</OutputType><AssemblyName>YH登录器-Py90</AssemblyName><TargetFramework>net6.0-windows7.0</TargetFramework>
+  <Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings><UseWPF>true</UseWPF><UseWindowsForms>true</UseWindowsForms>
+  <ApplicationManifest>app.manifest</ApplicationManifest><ApplicationIcon>Assets/login-icon.ico</ApplicationIcon>
+  <GenerateAssemblyInfo>false</GenerateAssemblyInfo><GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
+  <EnableDefaultCompileItems>false</EnableDefaultCompileItems><EnableDefaultPageItems>false</EnableDefaultPageItems>
+  <DefineConstants>$(DefineConstants);PYTHON90</DefineConstants><IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+  <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile><RestoreLockedMode>true</RestoreLockedMode><RuntimeIdentifiers>win-x86</RuntimeIdentifiers><LangVersion>12.0</LangVersion><PlatformTarget>x86</PlatformTarget><RuntimeFrameworkVersion>6.0.36</RuntimeFrameworkVersion><TargetLatestRuntimePatch>false</TargetLatestRuntimePatch><CheckEolTargetFramework>false</CheckEolTargetFramework><EnableSingleFileAnalyzer>false</EnableSingleFileAnalyzer>
+  <NuGetLockFilePath Condition="'$(PublishSingleFile)' == 'true'">packages.publish.lock.json</NuGetLockFilePath>
+  <SelfContained>false</SelfContained><EnableCompressionInSingleFile>false</EnableCompressionInSingleFile><DebugType>None</DebugType><DebugSymbols>false</DebugSymbols>
+ </PropertyGroup>
+ <ItemGroup><PackageReference Include="AduSkin" Version="1.1.1.9"/><PackageReference Include="SharpCompress" Version="0.50.4"/></ItemGroup>
+ <ItemGroup><Using Remove="System.Windows.Forms"/><Using Remove="System.Drawing"/></ItemGroup>
+ <ItemGroup>
+  <Compile Include="App.xaml.cs" /><Compile Include="Compatibility.cs" />
+  <Compile Include="AppConfig.cs" />
+  <Compile Include="LauncherVersion.cs" />
+  <Compile Include="MainWindow.xaml.cs" />
+  <Compile Include="LoginWindow.xaml.cs" />
+  <Compile Include="LoginWindow.Python90.cs" />
+  <Compile Include="LoginWindow.PythonNotifications.cs" />
+  <Compile Include="SettingsControl.xaml.cs" />
+  <Compile Include="CloseActionDialog.xaml.cs" />
+  <Compile Include="PythonCdkRedeemControl.cs" />
+  <Compile Include="PythonRecoveryWindow.cs" />
+  <Compile Include="PythonRegisterWindow.cs" />
+  <Compile Include="Properties/AssemblyInfo.cs" />
+  <Compile Include="Services/GameProcessManager.cs" />
+  <Compile Include="Services/LauncherPackage.cs" />
+  <Compile Include="Services/ClientImages.cs" />
+  <Compile Include="Services/ClientDiagnostics.cs" />
+  <Compile Include="Services/PythonAnnouncementOverlay.cs" />
+  <Compile Include="Services/PythonChannelRoute.cs" />
+  <Compile Include="Services/PythonClientLauncher.cs" />
+  <Compile Include="Services/PythonGameAssist.cs" />
+  <Compile Include="Services/PythonPartyRelay.cs" />
+  <Compile Include="Services/NativeRelayProofRecovery.cs" />
+  <Compile Include="Services/ClientCodeProtection.cs" />
+  <Compile Include="$(ClientProtectionSecretsSource)" Condition="'$(ClientProtectionSecretsSource)' != ''" />
+  <Compile Include="Services/PythonClientLocation.cs" />
+  <Compile Include="Services/PythonDeviceIdentity.cs" />
+  <Compile Include="Services/PythonLauncherApi.cs" />
+  <Compile Include="Services/PythonRechargeBridge.cs" />
+  <Compile Include="Services/PythonSessionErrors.cs" />
+  <Compile Include="Services/PythonLauncherPaths.cs" />
+  <Compile Include="Services/PythonNativeRoutes.cs" />
+  <Compile Include="Services/PythonPatchUpdater.cs" />
+  <Compile Include="Services/PythonRememberedLogin.cs" />
+  <Compile Include="Services/PythonResourceUpdater.cs" />
+  <Compile Include="Services/PythonUpdateTrust.cs" />
+  <Compile Include="Services/PythonUpdateTransaction.cs" />
+  <Page Include="MainWindow.xaml" />
+  <Page Include="LoginWindow.xaml" />
+  <Page Include="SettingsControl.xaml" />
+  <Page Include="CloseActionDialog.xaml" />
+  <Page Include="CommonStyles.xaml" />
+ </ItemGroup>
+ <ItemGroup>
+  <EmbeddedResource Include="$(GameAssistBridgeOutput)/GameAssistBridge.dll" LogicalName="DNFLogin.Resources.GameAssistBridge.dll" />
+  <EmbeddedResource Include="$(GameAssistBridgeOutput)/GameAssistBridge.runtimeconfig.json" LogicalName="DNFLogin.Resources.GameAssistBridge.runtimeconfig.json" />
+  <EmbeddedResource Include="Assets/PythonClientPins.json" LogicalName="DNFLogin.Resources.PythonClientPins.json" />
+  <EmbeddedResource Include="Helper/DNFHelper-Py90.dll" LogicalName="DNFLogin.Resources.DNFHelper-Py90.dll" />
+  <EmbeddedResource Include="Helper/launch_py90_client.exe" LogicalName="DNFLogin.Resources.launch_py90_client.exe" />
+  <EmbeddedResource Include="$(PartyRelayExecutable)" LogicalName="DNFLogin.Resources.party-relay.exe" Condition="'$(PartyRelayExecutable)' != ''" />
+ </ItemGroup>
+</Project>

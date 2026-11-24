@@ -1,0 +1,3 @@
+<Project Sdk="Microsoft.NET.Sdk">
+ <PropertyGroup><OutputType>Exe</OutputType><LangVersion>12.0</LangVersion><CheckEolTargetFramework>false</CheckEolTargetFramework><TargetFramework>net6.0-windows7.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><DebugType>None</DebugType><DebugSymbols>false</DebugSymbols><AssemblyName>GameAssistBridge</AssemblyName><RuntimeFrameworkVersion>6.0.36</RuntimeFrameworkVersion><TargetLatestRuntimePatch>false</TargetLatestRuntimePatch></PropertyGroup>
+</Project>

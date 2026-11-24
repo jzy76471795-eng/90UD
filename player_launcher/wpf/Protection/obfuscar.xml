@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Obfuscator>
+  <Var name="InPath" value="INPUT_DIRECTORY" />
+  <Var name="OutPath" value="OUTPUT_DIRECTORY" />
+  <Var name="KeepPublicApi" value="true" />
+  <Var name="HidePrivateApi" value="true" />
+  <Var name="HideStrings" value="true" />
+  <Var name="RenameProperties" value="false" />
+  <Var name="RenameEvents" value="false" />
+  <Var name="UseUnicodeNames" value="false" />
+  <Var name="ReuseNames" value="false" />
+  <Var name="SuppressIldasm" value="false" />
+  <Module file="INPUT_ASSEMBLY">
+    <!-- WPF BAML, event handlers, markup extensions and binding names are contracts. -->
+    <SkipType name="DNFLogin.App" skipMethods="true" skipFields="true" skipProperties="true" skipEvents="true" />
+    <SkipType name="DNFLogin.LoginWindow" skipMethods="true" skipFields="true" skipProperties="true" skipEvents="true" />
+    <SkipType name="DNFLogin.MainWindow" skipMethods="true" skipFields="true" skipProperties="true" skipEvents="true" />
+    <SkipType name="DNFLogin.SettingsControl" skipMethods="true" skipFields="true" skipProperties="true" skipEvents="true" />
+    <SkipType name="DNFLogin.CloseActionDialog" skipMethods="true" skipFields="true" skipProperties="true" skipEvents="true" />
+    <SkipType name="DNFLogin.Services.ClientImageExtension" skipMethods="true" skipFields="true" skipProperties="true" skipEvents="true" />
+    <!-- JSON constructor/anonymous-object names must remain compatible with the server. -->
+    <SkipType name="*AnonymousType*" skipMethods="true" skipFields="true" skipProperties="true" skipEvents="true" />
+    <SkipType name="DNFLogin.Services.PythonSavedLogin" skipMethods="true" skipFields="true" skipProperties="true" skipEvents="true" />
+    <!-- Native entry points without an explicit EntryPoint must keep their names. -->
+    <SkipMethod type="*" rx="^(CryptProtectData|CryptUnprotectData|LocalFree|GetWindowRect|IsWindow|IsIconic|GetForegroundWindow|GetDpiForWindow|GetDC|ReleaseDC|GetDeviceCaps|GetWindowStyle|SetWindowStyle|NtQueryInformationProcess|GetExtendedTcpTable)$" />
+  </Module>
+</Obfuscator>

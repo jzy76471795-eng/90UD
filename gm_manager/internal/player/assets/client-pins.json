@@ -1,0 +1,134 @@
+{
+  "dlls": [
+    {
+      "label": "func_extend",
+      "relative_path": "runtime/server/patches/usdof_func_extend/build/Release-Win32/usdof_func_extend.dll",
+      "bytes": 454144,
+      "sha256": "34f59e24a4e1f4c58601d313ae9b0f9d2468b039e07d851bf9927bd64766d89b"
+    },
+    {
+      "label": "codec_passthrough",
+      "relative_path": "runtime/server/patches/usdof_codec_passthrough/build/Release-Win32/usdof_codec_passthrough.dll",
+      "bytes": 19968,
+      "sha256": "3ea1804cdc75ec2d58bfcdcd5458ccf3bad89576cce0fa4c4b6d496ed495db68"
+    },
+    {
+      "label": "desktop_focus_guard",
+      "relative_path": "runtime/server/patches/usdof_desktop_focus_guard/build/Release-Win32/usdof_desktop_focus_guard.dll",
+      "bytes": 37888,
+      "sha256": "d7194f1567b5418d3bf06d5f88f4f7d79a9f761e00a1e992633f3115c283d697"
+    },
+    {
+      "label": "forbidden_func",
+      "relative_path": "runtime/server/patches/forbidden-func/build/Release-Win32/forbidden-func.dll",
+      "bytes": 37376,
+      "sha256": "6d1e3508a53f387e375d7827c42f338180f8647cba9777ba75b476e72eb860a6"
+    },
+    {
+      "label": "weapon_avatar_dungeon",
+      "relative_path": "runtime/server/patches/usdof_weapon_avatar_dungeon/build/Release-Win32/usdof_weapon_avatar_dungeon.dll",
+      "bytes": 47104,
+      "sha256": "acd08e005fa8cd9fff2391d2b056704ac9539f4e46da5b786f093ae35bcd8368"
+    },
+    {
+      "label": "native_loadout",
+      "relative_path": "runtime/server/patches/usdof_native_loadout/build/Release-Win32/usdof_native_loadout.dll",
+      "bytes": 43520,
+      "sha256": "4b6b5d2a2537f274295c070ddb09af01c19df825b65a00f7dfb7379acca1c0a9"
+    },
+    {
+      "label": "usdof_clone_appearance_trace",
+      "relative_path": "us_extend_dll/usdof_clone_appearance_trace.dll",
+      "bytes": 21504,
+      "sha256": "947ad2c9624648d25927e45734416c978922a75e693b838e5440af3a09d32cb7"
+    },
+    {
+      "label": "usdof_clone_skin_init",
+      "relative_path": "us_extend_dll/usdof_clone_skin_init.dll",
+      "bytes": 69120,
+      "sha256": "1935132f70f2c5e460dfec34828b8aca78fb03f8dffe116d16aea6d20614c4f5"
+    },
+    {
+      "label": "usdof_cn_fix",
+      "relative_path": "us_extend_dll/usdof_cn_fix.dll",
+      "bytes": 59904,
+      "sha256": "848fa70edaf9deb4e6e8f01640a243d666a6c75d86ec1598a3e9eba67fa0d2b9",
+      "approved_variants": [
+        {
+          "release": "cn-ime-observer-20261018-revision2",
+          "bytes": 60928,
+          "sha256": "c20c5d5b5e12a75ac9957ef306fc22ac6348f0dc008187e451d900c3c6c37e81"
+        },
+        {
+          "release": "cn-ime-context-20261027",
+          "bytes": 68608,
+          "sha256": "b0a1347fc6b52efd05faf98ec74ec08d9c20883cae881f4b1c89f9921effeec0"
+        }
+      ]
+    },
+    {
+      "label": "usdof_discard_guard",
+      "relative_path": "us_extend_dll/usdof_discard_guard.dll",
+      "bytes": 64000,
+      "sha256": "aeddfccfaa8a245b6204cefc845cc42e3f71aeb7ead1f6f0866fcb0d1c14b020"
+    },
+    {
+      "label": "usdof_duel_native_fix",
+      "relative_path": "us_extend_dll/usdof_duel_native_fix.dll",
+      "bytes": 69120,
+      "sha256": "cbdc2772159d7c0b5dc29fc21de3da5638357054b9edeeab473b150c687a27b1"
+    },
+    {
+      "label": "usdof_fengling_init_guard",
+      "relative_path": "us_extend_dll/usdof_fengling_init_guard.dll",
+      "bytes": 15872,
+      "sha256": "0bada8a5ca1b81af4d3771c1cdb483f664ede9b75d748734186ae97935b010e1"
+    },
+    {
+      "label": "usdof_ime_lifecycle_fix",
+      "relative_path": "us_extend_dll/usdof_ime_lifecycle_fix.dll",
+      "bytes": 59904,
+      "sha256": "c2e53e08bca22b145e226bc7d7e0c9d247d051c88b2687a990174d8dcd3131bd"
+    },
+    {
+      "label": "usdof_incident_guard",
+      "relative_path": "us_extend_dll/usdof_incident_guard.dll",
+      "bytes": 63488,
+      "sha256": "e731b604289e2b709a05f5b54cd4959a8e0d795f71bce9c0025072a02e24611e"
+    },
+    {
+      "label": "usdof_party_edit_save_fix",
+      "relative_path": "us_extend_dll/usdof_party_edit_save_fix.dll",
+      "bytes": 57344,
+      "sha256": "8710be98621893f2bd048642b805d4deae208c4202baebd3339a232825b8ca13"
+    },
+    {
+      "label": "usdof_party_ui_mode_fix",
+      "relative_path": "us_extend_dll/usdof_party_ui_mode_fix.dll",
+      "bytes": 58880,
+      "sha256": "f484881f4d6ebc832456b0a758586e7a929a6eee8063bf01880192bc7955e452"
+    }
+  ],
+  "injector": {
+    "label": "injector",
+    "relative_path": "runtime/server/patches/client_injector/build/Release-Win32/launch_usdof_client.exe",
+    "bytes": 375808,
+    "sha256": "816c48a681f0357ad0dd48b5c93f7fb68f1f46778400a3146f98dfab76c26614"
+  },
+  "optional_dlls": [
+    {
+      "label": "raid_run_coin",
+      "relative_path": "us_extend_dll/usdof_raid_run_coin.dll",
+      "bytes": 77220,
+      "sha256": "d770c2d0fe67e65ca363d545c2a71fd1f2862d0acc1320cdcf0477cfd09e58c1",
+      "release": "channel-classification-identity-20261027",
+      "approved_variants": [
+        {
+          "release": "channel-ui-retry-loopback-20261028",
+          "bytes": 80539,
+          "sha256": "a6b36df36cbeb7240e6275d084b6533bcf3e95c2201a3ceb40a338602f8c9bcd"
+        }
+      ]
+    }
+  ]
+}

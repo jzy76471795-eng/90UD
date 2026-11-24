@@ -1,0 +1,28 @@
+<Project>
+  <PropertyGroup>
+    <LauncherProtection Condition="'$(LauncherProtection)' == ''">true</LauncherProtection>
+  </PropertyGroup>
+  <Target Name="RequireProtectedLauncherRelease" BeforeTargets="PrepareForBuild" Condition="'$(PublishSingleFile)' == 'true'">
+    <Error Condition="'$(LauncherProtection)' != 'true'" Text="发布必须执行登录器混淆，请使用配套的受保护客户端构建脚本。" />
+    <Error Condition="'$(ClientProtectionSecretsSource)' == '' or !Exists('$(ClientProtectionSecretsSource)')" Text="缺少客户端保护构建输入，请使用配套的受保护客户端构建脚本。" />
+  </Target>
+  <!-- Replace the managed assembly before the .NET SDK creates its single-file bundle. -->
+  <Target Name="ProtectLauncherBeforeBundling"
+          BeforeTargets="_GenerateSingleFileBundleInputCache"
+          DependsOnTargets="PrepareForBundle"
+          Condition="'$(LauncherProtection)' == 'true' and '$(PublishSingleFile)' == 'true'">
+    <Error Condition="'$(LauncherProtectionTool)' == '' or '$(LauncherProtectionDotnet)' == '' or '$(LauncherProtectionRuntime)' == '' or '$(LauncherProtectionOutput)' == ''"
+           Text="Launcher protection requires explicit tool, dotnet, runtime and output paths." />
+    <ItemGroup>
+      <_LauncherProtectionInput Include="@(FilesToBundle)" Condition="'%(FilesToBundle.Filename)%(FilesToBundle.Extension)' == '$(TargetFileName)'" />
+    </ItemGroup>
+    <Error Condition="'@(_LauncherProtectionInput)' == ''" Text="Managed launcher assembly is missing from the single-file bundle." />
+    <MakeDir Directories="$(LauncherProtectionOutput)" />
+    <WriteLinesToFile File="$(LauncherProtectionOutput)\bundle-inputs.txt" Lines="@(FilesToBundle->'%(FullPath)')" Overwrite="true" Encoding="UTF-8" />
+    <Exec Command="powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;$(MSBuildThisFileDirectory)Protection\Protect-Assembly.ps1&quot; -InputAssembly &quot;@(_LauncherProtectionInput->'%(FullPath)')&quot; -OutputDirectory &quot;$(LauncherProtectionOutput)&quot; -DotnetExe &quot;$(LauncherProtectionDotnet)&quot; -ObfuscarDll &quot;$(LauncherProtectionTool)&quot; -RuntimeRoot &quot;$(LauncherProtectionRuntime)&quot; -DependencyList &quot;$(LauncherProtectionOutput)\bundle-inputs.txt&quot;" />
+    <ItemGroup>
+      <FilesToBundle Remove="@(_LauncherProtectionInput)" />
+      <FilesToBundle Include="$(LauncherProtectionOutput)\$(TargetFileName)" RelativePath="$(TargetFileName)" />
+    </ItemGroup>
+  </Target>
+</Project>
