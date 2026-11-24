@@ -240,8 +240,8 @@ public sealed class PythonPartyRelay : IDisposable
             used=process;
             if(used is null||used.HasExited)return (ClosedReply(frame),used);
             var sequence=++exchangeSequence;
-            await WriteAsync(process,new {sequence,native_frame=Convert.ToBase64String(frame)},cancellation).ConfigureAwait(false);
-            using var reply=JsonDocument.Parse(await BoundedLineAsync(process.StandardOutput,cancellation).ConfigureAwait(false));
+            await WriteAsync(used,new {sequence,native_frame=Convert.ToBase64String(frame)},cancellation).ConfigureAwait(false);
+            using var reply=JsonDocument.Parse(await BoundedLineAsync(used.StandardOutput,cancellation).ConfigureAwait(false));
             if(reply.RootElement.GetProperty("sequence").GetUInt64()!=sequence)throw new IOException("组队私有响应序号错误。");
             var result=Convert.FromBase64String(reply.RootElement.GetProperty("native_frame").GetString()!);
             if(result.Length is <64 or >184||BinaryPrimitives.ReadUInt64LittleEndian(result.AsSpan(16))!=BinaryPrimitives.ReadUInt64LittleEndian(frame.AsSpan(16)))throw new IOException("组队私有响应长度错误。");
