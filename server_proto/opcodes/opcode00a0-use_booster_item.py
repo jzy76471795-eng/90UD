@@ -9,6 +9,10 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from game.chain_loader import load_chain
+from game.character.fatigue_flow import RESET_UTC_OFFSET_SECONDS
+from game.quest.weekly_attendance import (
+    DATED_CONTENT_ITEMS, LEVEL_GATED_BOXES, MILESTONE_ITEMS, RAID_DAILY_REWARDS, WEEKLY_ITEMS,
+)
 from game.character.character_db import InventoryGrantSpec
 from game.character.inventory_item_view import InventoryItemView
 from game.character.item_metadata import (
@@ -218,7 +222,11 @@ def parse_use_booster_selection_request(
             continue
         avatar_count = int(raw[avatar_count_offset])
         expected_length = avatar_count_offset + 1 + avatar_count * 5
-        if expected_length != len(raw):
+        padded_length = (expected_length + 7) & ~7
+        if expected_length > len(raw) or (
+            expected_length != len(raw)
+            and (len(raw) != padded_length or any(raw[expected_length:]))
+        ):
             continue
 
         selected_ids = tuple(
@@ -278,6 +286,8 @@ def build_direct_booster_grants(
     definition: BoosterItemDefinition,
     *,
     now_unix: int,
+    attendance_deadline: int = 0,
+    source_expire_time: int = 0,
     randbelow: Callable[[int], int] | None = None,
 ) -> tuple[list[InventoryGrantSpec] | None, str]:
     try:
@@ -306,6 +316,12 @@ def build_direct_booster_grants(
             )
         option = int(candidate.option_value) & 0xFF if metadata.is_avatar else 0
         expire = resolve_purchase_expire_time(metadata, now_unix=now_unix)
+        if attendance_deadline and item_id in DATED_CONTENT_ITEMS:
+            expire = min(expire, attendance_deadline) if expire else attendance_deadline
+        if item_id == RAID_DAILY_REWARDS.get(definition.source_item_id):
+            day = (now_unix + RESET_UTC_OFFSET_SECONDS) // 86400
+            reset = (day + 1) * 86400 - RESET_UTC_OFFSET_SECONDS
+            expire = min(expire or reset, source_expire_time or reset, reset)
         key = (item_id, option, expire)
         previous_count, _previous_metadata = aggregate.get(key, (0, metadata))
         final_count = int(previous_count) + int(candidate.count)
@@ -489,6 +505,10 @@ class UseBoosterItem00A0Service:
         if source is None:
             return self._failure("source_slot_empty=%d" % source_slot)
         source_item_id = int(source.get("item_template_id", 0) or 0) & 0xFFFFFFFF
+        if source_item_id in LEVEL_GATED_BOXES:
+            character_level = repo.get_character_level_job(character_id)
+            if character_level is None or not resolve_item_metadata(source_item_id).is_level_allowed(character_level[0]):
+                return self._failure("attendance_box_level_required item=%d" % source_item_id)
         direct_definition = resolve_booster_item(source_item_id)
         selection_definition = (
             None
@@ -512,9 +532,17 @@ class UseBoosterItem00A0Service:
                     % (source_item_id, len(raw_body))
                 )
             request = direct_request
+            source_expire_time = int(source.get("expire_time", 0) or 0)
+            attendance_deadline = (
+                source_expire_time
+                if source_item_id in WEEKLY_ITEMS or source_item_id in MILESTONE_ITEMS.values()
+                else 0
+            )
             grants, grant_note = build_direct_booster_grants(
                 direct_definition,
                 now_unix=now_unix,
+                attendance_deadline=attendance_deadline,
+                source_expire_time=source_expire_time,
             )
             booster_kind = "direct"
             allowed_source_types = DIRECT_BOOSTER_TYPE_PREFIXES

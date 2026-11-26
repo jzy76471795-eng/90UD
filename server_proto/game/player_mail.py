@@ -54,6 +54,8 @@ class Reader:
         value = self.string(48)
         if not 1 <= len(value) <= 12:
             raise MailError('收件角色名称长度无效。')
+        if '?' in value or '\ufffd' in value:
+            raise MailError('收件角色名称包含无法识别的字符。', 2)
         return value
 
     def finish(self):

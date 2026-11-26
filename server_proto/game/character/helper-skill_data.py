@@ -355,6 +355,25 @@ def free_baseline_levels(job: int, grow_type: int = 0) -> dict[int, int]:
     return out
 
 
+def skill_growth_grants(job: int, grow_type: int) -> set[int]:
+    from game.chain_loader import load_chain
+
+    grants = set(free_baseline_levels(job, grow_type))
+    profile = load_chain("helper-job_change.py").load_chr_skill_profile(job)
+    grants.update(int(skill_id) for skill_id, level in profile.get("initial", ()) if level > 0)
+    return grants
+
+
+def skill_allowed_for_growth(job: int, grow_type: int, skill_id: int, grants: set[int]) -> bool:
+    """Allow native starter/granted abilities and skills learnable by this branch."""
+    if skill_id in grants:
+        return True
+    skill = get_skill_static(job, skill_id)
+    first_grow = int(grow_type) & 0x0F
+    return (skill is not None and skill.max_level_for_grow(first_grow) > 0
+            and skill.maximum_level_for_grow(first_grow) > 0)
+
+
 def allocate_skill_slot(
     *,
     is_active: bool,

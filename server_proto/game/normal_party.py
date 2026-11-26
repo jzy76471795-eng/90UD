@@ -1,6 +1,7 @@
 """Authenticated ordinary-channel party creation/edit/leave, outside raids."""
 from dataclasses import dataclass, field
 from threading import RLock
+import sqlite3
 import struct
 import time
 
@@ -18,6 +19,8 @@ class Party:
     request: bytes
     members: dict = field(default_factory=dict)
     revision: int = 0
+    host_pending: set = field(default_factory=set)
+    peer_refresh_pending: set = field(default_factory=set)
 
 
 @dataclass
@@ -101,11 +104,32 @@ class NormalParties:
         except RaidError:
             return False
 
-    def _queue(self, target, flag, opcode, body, *, invite=None, party=None, revision=None):
+    def _current_queue(self, target):
         queue = self._queues.setdefault(target[0], [])
-        if len(queue) >= 128:
+        current = self._parties.get(id(target[0].session))
+        invitation = self._invites.get(target[0])
+        queue[:] = [row for row in queue if row[0] == target
+                    and (row[4] is None or row[4] is invitation)
+                    and (row[5] is None or (row[5] is current and row[6] == current.revision))]
+        return queue
+
+    def _queue(self, target, flag, opcode, body, *, invite=None, party=None, revision=None):
+        queue = self._current_queue(target)
+        row = (target, flag, opcode, body, invite, party, revision)
+        if party is not None:
+            # One current state packet per opcode. Keep the pending address
+            # until the owning socket writes it, including across revisions.
+            queue[:] = [pending for pending in queue
+                        if pending[5] is not party or pending[1:3] != (flag, opcode)]
+            if (flag, opcode) == (0, 11):
+                party.peer_refresh_pending.add(target[0])
+        elif (flag, opcode) == (0, 9):
+            # Each distinct party clear must survive other queued notices.
+            if any(pending[5] is None and pending[1:4] == row[1:4] for pending in queue):
+                return
+        elif len(queue) >= 128:
             raise RaidError('ordinary party delivery queue full')
-        queue.append((target, flag, opcode, body, invite, party, revision))
+        queue.append(row)
 
     def _roster(self, party):
         _, name, maximum, info, difficulty, dungeon, aux, aux2 = parse_request(party.request)
@@ -122,21 +146,38 @@ class NormalParties:
             return body[:10] + bytes((name_selector,)) + body[15:]
         return body[:11] + struct.pack('<I',len(name)) + name + body[15:]
 
-    def _notify(self, party, omit=None, *, peers=None, refresh_peers=True):
+    def _notify(self, party, omit=None, *, peers=None, refresh_peers=True, host_changed=False):
         party.revision += 1
         body = self._roster(party)
-        if refresh_peers and peers is None and len(party.members) > 1:
+        if host_changed:
+            party.host_pending.update(target[0] for target in party.members.values())
+        host_slot = (next(slot for slot, target in party.members.items() if target == party.owner)
+                     if party.host_pending else None)
+        if len(party.members) <= 1 and refresh_peers:
+            party.peer_refresh_pending.clear()
+        elif refresh_peers and peers is None:
             try:
                 peers = self._peer_addresses(party.members.values())
             except RaidError:
-                # Departures must still remove unavailable members. No new
-                # endpoint is invented to make an expired transport look live.
-                pass
+                party.peer_refresh_pending.update(target[0] for target in party.members.values())
         for target in party.members.values():
+            deferred_peers = target[0] in party.peer_refresh_pending
             if target != omit:
-                if peers is not None:
+                if peers is not None and not deferred_peers:
                     self._queue(target,0,11,peers,party=party,revision=party.revision)
                 self._queue(target,0,9,body,party=party,revision=party.revision)
+            if target[0] in party.host_pending:
+                # Native 016528F0 updates the live dungeon host even if
+                # PARTY_INFO is staged until town. Carry it to newer rosters
+                # until the recipient's socket actually writes it.
+                self._queue(target,0,0x1a,bytes((host_slot,)),party=party,revision=party.revision)
+            if deferred_peers:
+                if target == omit and peers is not None:
+                    party.peer_refresh_pending.discard(target[0])
+                else:
+                    # Deliver the roster and host immediately. The socket pump
+                    # rebuilds this deferred packet from current owned routes.
+                    self._queue(target,0,11,b'',party=party,revision=party.revision)
         return body
 
     def _peer_addresses(self, selections):
@@ -149,7 +190,16 @@ class NormalParties:
         for selection, match in zip(selections, matches):
             report = match.report
             key = self.server.native_game_connections.key_for_selection(selection)
-            projection = userinfo0_projection(service_for(self.server).build_body(selection))
+            try:
+                profile = service_for(self.server).build_body(selection)
+            except sqlite3.OperationalError as exc:
+                code = getattr(exc, 'sqlite_errorcode', None)
+                if code is None or code & 0xff not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                    raise
+                # Both roster construction and the socket pump already retry
+                # addresses that cannot be validated on the current revision.
+                raise RaidError('ordinary party public actor profile temporarily busy') from exc
+            projection = userinfo0_projection(profile)
             if projection is None or projection.character_id != selection[4] or not 0 <= projection.weakness <= 100:
                 raise RaidError('ordinary party public actor profile unavailable')
             observed_kind = 3 if getattr(match,'continuity_port',None) is not None else report.nat_kind
@@ -186,14 +236,15 @@ class NormalParties:
         return tuple(matches)
 
     def _clear(self, selection, party):
-        body = load_chain('helper-party_info.py').build_current_namespace_party_clear(party_id=party.party_id)
-        self._queue(selection,0,9,body)
+        if self._live(selection):
+            body = load_chain('helper-party_info.py').build_current_namespace_party_clear(party_id=party.party_id)
+            self._queue(selection,0,9,body)
 
     def _cancel_invite(self, invite, value=1):
         if self._invites.get(invite.recipient[0]) is not invite:
             return
         self._invites.pop(invite.recipient[0], None)
-        if self._live(invite.sender) and len(self._queues.get(invite.sender[0], ())) < 128:
+        if self._live(invite.sender) and len(self._current_queue(invite.sender)) < 128:
             # Frozen016757F0 consumes H,B,I. Mode0's decline branch needs
             # no extra fields and completes the sender's native request UI.
             self._queue(invite.sender,0,8,struct.pack('<HBI',invite.recipient[4],invite.mode,value))
@@ -213,6 +264,8 @@ class NormalParties:
         self.selectors.abort(party)
         self._parties.pop(id(selection[0].session), None)
         party.members = {slot:s for slot,s in party.members.items() if s != selection}
+        party.host_pending.discard(selection[0])
+        party.peer_refresh_pending.discard(selection[0])
         self._clear(selection,party)
         if party.members:
             changed_host = party.owner == selection
@@ -221,16 +274,7 @@ class NormalParties:
                 # Native transport slots belong to the surviving actors.
                 # Host succession must not move one actor into another slot.
                 party.owner = party.members[slot]
-            self._notify(party, refresh_peers=refresh_peers)
-            if changed_host:
-                self._notify_host(party)
-
-    def _notify_host(self, party):
-        # Native 016528F0 consumes one slot and updates the live dungeon host.
-        # PARTY_INFO can stage a roster until town; host ownership cannot wait.
-        slot = next(k for k,v in party.members.items() if v == party.owner)
-        for member in party.members.values():
-            self._queue(member,0,0x1a,bytes([slot]),party=party,revision=party.revision)
+            self._notify(party, refresh_peers=refresh_peers, host_changed=changed_host)
 
     def _prune(self):
         self.udp.prune()
@@ -336,8 +380,8 @@ class NormalParties:
         members = tuple(party.members.values()) if party is not None else (leader,)
         self._peer_addresses(members + (joiner,))
         invite = Invitation(owner,recipient,leader,joiner,party,mode,self.clock()+30)
-        self._invites[recipient[0]] = invite
         self._queue(recipient,0,7,struct.pack('<HBIHHHI',owner[4],mode,value,aux,0,0,value2),invite=invite)
+        self._invites[recipient[0]] = invite
         return [self.server._codec_response(1,10,b'\x01')], 'ordinary party invitation queued'
 
     def _accept(self, owner, body):
@@ -375,9 +419,6 @@ class NormalParties:
         # Validate both real transports before changing either membership.
         members = tuple(party.members.values()) if party is not None else (invite.leader,)
         peers = self._peer_addresses(members + (invite.joiner,))
-        for member in members + (invite.joiner,):
-            if len(self._queues.get(member[0], ())) > 124:
-                raise RaidError('ordinary party delivery queue full')
         self._invites.pop(owner[0],None)
         if joiner_party is not None:
             self._remove(invite.joiner)
@@ -460,12 +501,11 @@ class NormalParties:
                     if invite.party is previous:
                         self._cancel_invite(invite)
                 previous.owner = previous.members[slot]
-                self._notify(previous,refresh_peers=False)
-                self._notify_host(previous)
+                self._notify(previous,refresh_peers=False,host_changed=True)
                 return [self.server._codec_response(1,0x79,b'\1')], 'ordinary party host appointed'
             if opcode == 14:
                 slot = self._fixed(body,1)[0]
-                if previous is None or previous.owner != owner or slot == 0 or slot not in previous.members:
+                if previous is None or previous.owner != owner or slot not in previous.members or previous.members[slot] == owner:
                     raise RaidError('party kick requires current leader and member slot')
                 self._remove(previous.members[slot])
                 return [self.server._codec_response(1,14,b'\x01')], 'ordinary party member removed'
@@ -480,7 +520,6 @@ class NormalParties:
                 party = previous
                 if max(party.members) >= maximum:
                     raise RaidError('party capacity would discard a current member')
-                party.request = raw
             try:
                 # 016725F0 initializes the selected actor's transport fields
                 # too. A solo-created party must not wait for a second member
@@ -490,6 +529,7 @@ class NormalParties:
                 if len(party.members) > 1:
                     raise
                 peers = None
+            party.request = raw
             roster = self._notify(party,omit=owner,peers=peers)
             if peers is None:
                 # C0002 and the actual UDP observation can arrive after C000C.
@@ -527,6 +567,7 @@ class NormalParties:
                 if party is not None and (party.revision != revision or self._parties.get(id(session)) is not party):
                     continue
                 if party is not None and (id(party),revision) in blocked:
+                    self._queue(target,flag,opcode,body,invite=invite,party=party,revision=revision)
                     continue
                 members = tuple(party.members.values()) if party is not None else ()
                 if invite is not None:
@@ -544,14 +585,18 @@ class NormalParties:
                     with self._lock:
                         blocked.add((id(party),revision))
                         if party.revision == revision and self._parties.get(id(session)) is party:
-                            self._queue(owner,0,11,body,party=party,revision=revision)
-                            self._queue(owner,0,9,self._roster(party),party=party,revision=revision)
+                            self._queue(target,flag,opcode,body,invite=invite,party=party,revision=revision)
                     continue
             with self._lock:
                 if (not self._live(owner) or (party is not None and
                         (party.revision != revision or self._parties.get(id(session)) is not party))):
                     continue
             client.sendall(self.server._codec_response(flag,opcode,body))
+            if opcode in (11, 0x1a) and party is not None:
+                with self._lock:
+                    if party.revision == revision and self._parties.get(id(session)) is party:
+                        pending = party.peer_refresh_pending if opcode == 11 else party.host_pending
+                        pending.discard(target[0])
             if invite is not None:
                 with self._lock:
                     if self._invites.get(owner[0]) is invite:

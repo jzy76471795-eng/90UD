@@ -24,10 +24,17 @@ and enter-Seria START_MAP chain (codec9 for 0x0017, codec for 0x0018).
 from __future__ import annotations
 
 import os
+import sqlite3
 import struct
 from typing import Any
 
 from game.character.payloads import build_area_users, build_user_area
+from game.quest.adventure_season1 import record_guild_hall_entry
+
+
+# Both PVFs map town 8 to guildagit.twn; the 90US file has areas 0–4.
+GUILD_HALL_TOWN_ID = 8
+GUILD_HALL_AREAS = range(5)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -126,6 +133,7 @@ class SetUserArea0024Service:
             return [self.server._codec_response(1, 0x0024,
                 bytes((0, 0x15, target_town, target_area)))], parse_note
 
+        previous_town = getattr(session, "cur_town_id", None)
         if session is not None:
             # An accepted native area request rebuilds local actors even when
             # its town/area equals the previous scope. Movement (0023) does not.
@@ -143,10 +151,11 @@ class SetUserArea0024Service:
         from game.raid.landing import is_raid_waiting_position
         waiting_position = is_raid_waiting_position(session, character_id)
         persist_note = "persist=skip"
+        position_saved = False
         if _env_bool("USDOF_GAME_SET_USER_AREA_PERSIST", True) and not waiting_position and not raid_gate_note:
             try:
                 repo = self.server._repo()
-                ok = repo.update_position(
+                position_saved = repo.update_position(
                     character_id,
                     town_id=parsed["town_id"],
                     area_id=parsed["area_id"],
@@ -155,7 +164,7 @@ class SetUserArea0024Service:
                     direction=parsed["direction"],
                     area_state=parsed["area_state"],
                 )
-                status = "ok" if ok else "miss"
+                status = "ok" if position_saved else "miss"
                 persist_note = f"persist={status} cid={character_id}"
             except Exception as exc:
                 persist_note = f"persist_fail cid={character_id} err={exc!r}"
@@ -163,6 +172,16 @@ class SetUserArea0024Service:
         key = character_id & 0xFFFF
         packets: list[bytes] = []
         notes: list[str] = []
+        if (
+            position_saved and previous_town is not None and previous_town != GUILD_HALL_TOWN_ID
+            and parsed["town_id"] == GUILD_HALL_TOWN_ID and parsed["area_id"] in GUILD_HALL_AREAS
+            and getattr(session, "enter_seria_settled", False) and not getattr(session, "in_dungeon_run", False)
+        ):
+            try:
+                if record_guild_hall_entry(self.server, session):
+                    persist_note += " adventure_season1_guild_hall=1"
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                persist_note += f" adventure_season1_guild_hall_error={type(exc).__name__}:{exc}"
 
         if _env_bool("USDOF_GAME_SET_USER_AREA_SEND_0017", True):
             body_0017 = build_user_area(

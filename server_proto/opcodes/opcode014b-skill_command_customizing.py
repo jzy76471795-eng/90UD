@@ -30,9 +30,6 @@ import os
 import struct
 from typing import Any, List, Optional, Tuple
 
-from game.quest.quest_session import resolve_selected_character_detail
-
-
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
@@ -66,30 +63,23 @@ def parse_skill_command_records(
     offset = 1
     while offset < len(data):
         # 尾部全 0 pad（历史 codec buffer 常见）直接结束
-        if all(b == 0 for b in data[offset:]):
+        if data[offset] == 0 and not any(data[offset:]):
             break
         if len(data) - offset < 3:
-            break
+            return page, [], "truncated_record_header"
         skill_id = struct.unpack_from("<H", data, offset)[0]
         cmd_len = int(data[offset + 2]) & 0xFF
         offset += 3
-        if skill_id == 0 and cmd_len == 0:
-            # 可能是 pad 起点
-            break
-        # AES 乱码常见：skill_id 极大且 cmd_len 把游标推出体长
-        if cmd_len < 0 or offset + cmd_len > len(data):
-            if records:
-                # 已解析出合法记录则截断收工（尾噪声）
-                break
-            return page, records, (
+        if skill_id == 0:
+            return page, [], "invalid_skill_id"
+        if offset + cmd_len > len(data):
+            return page, [], (
                 "truncated tree=%s skill=%s cmd_len=%s offset=%s body_len=%s"
                 % (tree, skill_id, cmd_len, offset, len(data))
             )
         cmd = bytes(data[offset : offset + cmd_len])
         offset += cmd_len
-        # 过滤明显乱码 skill_id（0 已在上面；保留 1..0xFFFF 业务 id）
-        if skill_id > 0:
-            records.append((int(skill_id) & 0xFFFF, cmd))
+        records.append((skill_id, cmd))
     if not records:
         # 无记录：tree>1 更像密文；tree∈{0,1} 可能是空改键
         if tree > 1:
@@ -156,84 +146,28 @@ class SkillCommandCustomizing014BService:
         data = bytes(body or b"")
         base = "C1/014B SKILL_COMMAND_CUSTOMIZING plain_len=%s" % (len(data),)
         page, records, parse_note = parse_skill_command_records(data)
-
-        # 明文应能解析出至少 1 条；乱码时 records 为空或 skill_id 异常
         if not records:
-            # 仍回 ACK，避免客户端卡 UI；不落库
-            ack = build_skill_command_ack(data)
+            # A genuine no-op may be acknowledged. Malformed records cannot
+            # be echoed into the native client as a successful change.
+            ack = build_skill_command_ack(data) if not any(data[1:]) else b"\x00"
             pkt = self.server._codec_response(1, 0x014B, ack)
-            return [pkt], (
-                "%s; parse_empty %s; ACK only (verify global codec passthrough); "
-                "wire=%s"
-                % (base, parse_note, len(pkt))
-            )
+            return [pkt], "%s; %s" % (base, parse_note)
 
-        ack = build_skill_command_ack(data)
-        pkt = self.server._codec_response(1, 0x014B, ack)
-        packets = [pkt]
-
-        persist_note = "persist=off"
-        if _env_bool("USDOF_GAME_SKILL_COMMAND_PERSIST", True):
-            cid = None
-            try:
-                detail = resolve_selected_character_detail(self.server, session)
-                cid = detail.get("character_id")
-            except Exception as exc:
-                persist_note = "persist=skip resolve_fail=%r" % (exc,)
-                detail = None
-            if session is not None and cid is None:
-                try:
-                    cid = getattr(session, "selected_character_id", None)
-                except Exception:
-                    pass
-            repo = None
-            try:
-                if hasattr(self.server, "_repo"):
-                    repo = self.server._repo()
-            except Exception:
-                repo = None
-            if cid and repo is not None:
-                updated = 0
-                details = []
-                for skill_id, cmd in records:
-                    try:
-                        # 独立库 character_skill_commands 为权威：
-                        # 技能未学 / 01EC 清树后仍保留；page 仅镜像 skills 行。
-                        n = int(
-                            repo.update_character_skill_command(
-                                int(cid),
-                                int(skill_id),
-                                cmd,
-                                page=None,
-                            )
-                            or 0
-                        )
-                        if n > 0:
-                            details.append(
-                                "sid=%s cmd_len=%s store_rows=%s"
-                                % (skill_id, len(cmd), n)
-                            )
-                        else:
-                            details.append(
-                                "sid=%s cmd_len=%s rows=0"
-                                % (skill_id, len(cmd))
-                            )
-                            continue
-                    except Exception as exc:
-                        details.append("sid=%s err=%r" % (skill_id, exc))
-                        continue
-                    updated += n
-                persist_note = "persist ok cid=%s page=%s updated=%s [%s]" % (
-                    int(cid),
-                    page,
-                    updated,
-                    ";".join(details[:8]),
+        updated = None
+        status = "invalid_owner_or_skill"
+        try:
+            account = int(getattr(self.server, "account_id", 0) or 0)
+            cid = int(getattr(session, "selected_character_id", 0) or 0)
+            if account > 0 and cid > 0 and int(getattr(session, "account_id", account) or 0) == account:
+                updated = self.server._repo().save_owned_skill_commands(
+                    account, cid, records, persist=_env_bool("USDOF_GAME_SKILL_COMMAND_PERSIST", True),
                 )
-            else:
-                persist_note = "persist=skip no_cid_or_repo cid=%r" % (cid,)
-
-        return packets, (
-            "%s; %s; ACK ok wire=%s; %s; "
-            "chain_file=opcodes/opcode014b-skill_command_customizing.py"
-            % (base, parse_note, len(pkt), persist_note)
-        )
+        except Exception as exc:
+            status = "storage:%s" % type(exc).__name__
+        if updated is None:
+            ack = b"\x00"
+        else:
+            ack = build_skill_command_ack(data)
+            status = "accepted updated=%s" % updated
+        pkt = self.server._codec_response(1, 0x014B, ack)
+        return [pkt], "%s; %s; page=%s; %s" % (base, parse_note, page, status)

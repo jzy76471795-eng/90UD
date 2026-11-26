@@ -34,7 +34,7 @@ def _load_skill_page(repo: Any, character: Any) -> tuple[tuple[Any, ...], str]:
     cid = _entry_int(character, "character_id")
     job = _entry_int(character, "job") & 0xFF
     skill_helper = load_chain("helper-character_skills.py")
-    rows = repo.load_character_skills(cid, page=0)
+    rows = repo.load_character_skills(cid, page=0, expected_job=job)
     skills = tuple(skill_helper.rows_to_initial_skills(rows))
     if skills:
         return skills, "skills=db_page0 n=%d" % len(skills)

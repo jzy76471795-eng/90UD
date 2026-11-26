@@ -12,6 +12,8 @@
 
 90USDFO 将游戏服务端、玩家登录器和 GM 后台的明文源码放在同一仓库。搭建者可为自己的实例配置服务器地址、HTTPS 证书和管理权限。
 
+2026 年 11 月 26 日源码快照包含中文创角、更名与邮件检查、卢克塔罗牌、冒险团及周周惊喜对接，以及组队和团本回城修复。
+
 | 组件 | 功能 | 源码 |
 | :--- | :--- | :--- |
 | **游戏服务端** | 账号会话、频道与角色、城镇和副本、PVF 资源加载与游戏数据存储 | [Python 服务](server_proto) · [Windows 辅助模块](server-pack-win10) |
@@ -63,6 +65,8 @@ $gm = ".\gm_manager\构建输出"
 <summary><strong>构建玩家登录器</strong></summary>
 
 在 x86 MSVC 开发环境中编译 [Helper 内的原生辅助模块](player_launcher/wpf/Helper)，再构建 [GameAssistBridge.csproj](player_launcher/bridge/GameAssistBridge.csproj) 和 [DNFLogin.csproj](player_launcher/wpf/DNFLogin.csproj)。设置 `GameAssistBridgeOutput` 指向桥接输出目录，设置 `ClientProtectionSecretsSource` 指向实例自己的保护构建输入。
+
+要将游戏辅助模块嵌入登录器，在 x86 MSVC 开发环境中以 C++17 编译 [game_assist.cpp](player_launcher/native_assist/game_assist.cpp) 为 DLL，并将 `GameAssistNativeModule` 指向生成的文件。
 
 </details>
 

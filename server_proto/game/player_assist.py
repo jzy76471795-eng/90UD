@@ -18,6 +18,13 @@ from game.quest.quest_common import env_bool
 
 RARITIES = frozenset(range(7))
 PICKUP_LEASE = 12.0
+ADVENTURE_ACTIONS = frozenset(("adventure-status", "adventure-complete", "adventure-claim", "adventure-claim-all"))
+ADVENTURE_TOWN = r"([0-9]{1,20}/[1-9][0-9]{0,19}:[0-9]{1,20})"
+ADVENTURE_TARGETS = {
+    "adventure-complete": re.compile(ADVENTURE_TOWN + r"/([1-9][0-9]{0,11})/(daily|weekly|season)/([0-9]{1,3})/([0-9]{1,5})"),
+    "adventure-claim": re.compile(ADVENTURE_TOWN + r"/([1-9][0-9]{0,11})/([1-9][0-9]?)"),
+    "adventure-claim-all": re.compile(ADVENTURE_TOWN + r"/([1-9][0-9]{0,11})"),
+}
 PROTECTED_FIELDS = (
     "equipment_lock_id", "sort_lock_flag", "option_value",
     "expire_time", "pet_serial_or_handle",
@@ -47,6 +54,50 @@ def _town_target(session):
             or session.in_dungeon_select or session.channel_move_settled):
         return ""
     return f"{session.selected_character_id}:{session.chat_selection_generation}"
+
+
+def _adventure_mail_packets(game, handlers, session):
+    try:
+        packets, _, _ = handlers["manager.mailbox_refresh"]({}, session)
+        return packets
+    except Exception as exc:
+        # The reward transaction has committed. The mailbox can synchronize again at its next refresh.
+        game.log(f"[Adventure] mailbox refresh deferred: {type(exc).__name__}")
+        return []
+
+
+def _adventure(game, handlers, session, action, town, params):
+    if not town:
+        _reject("TARGET_CHANGED", "请在当前角色的城镇中使用")
+    connection = f'{params["connection_generation"]}/{town}'
+    if action == "adventure-status":
+        packets, state, note = handlers["adventure_season1.status"]({}, session)
+        return packets, {**state, "adventure_target": connection}, note
+    target, activity, *selection = params["adventure_target"]
+    if connection != target:
+        _reject("TARGET_CHANGED", "请重新打开当前角色的探险记")
+    from game.quest.adventure_season1 import (
+        active_start, claim_all_basic_rewards, claim_basic_reward, complete_mission,
+    )
+    now = time.time()
+    start = int(activity)
+    if active_start(now) != start:
+        _reject("TARGET_CHANGED", "赛季已刷新，请重新查看探险记")
+    try:
+        if action == "adventure-complete":
+            period, bucket, mission_id = selection
+            completed = complete_mission(game, session, period, int(bucket), int(mission_id), now=now)
+            return [], {"completed": completed}, "adventure mission completed"
+        if action == "adventure-claim":
+            delivered = claim_basic_reward(game, session, int(selection[0]), now=now)
+            result, received = {"delivered": delivered}, delivered
+        else:
+            levels = claim_all_basic_rewards(game, session, now=now)
+            result, received = {"claimed_levels": levels}, bool(levels)
+    except ValueError as exc:
+        raise ControlApiError("ADVENTURE_ACTION_REJECTED", str(exc), status=409) from exc
+    packets = _adventure_mail_packets(game, handlers, session) if received else []
+    return packets, result, "adventure basic rewards claimed"
 
 
 def _candidates(rows, rarities, action):
@@ -137,6 +188,8 @@ def install(game, handlers, live_contexts):
         if action == "configure":
             session.assist_pickup_until = time.monotonic() + PICKUP_LEASE if params["pickup"] else 0
             return [], {"target": f'{params["connection_generation"]}/{target}' if target else "", "door_target":door.snapshot(session)}, "assist settings"
+        if action in ADVENTURE_ACTIONS:
+            return _adventure(game, handlers, session, action, target, params)
         if not target or target != params["target"].split("/", 1)[1]:
             _reject("TARGET_CHANGED", "请在当前角色的城镇中使用")
         if session.pending_disjoint_item_bodies:
@@ -158,10 +211,20 @@ def install(game, handlers, live_contexts):
         aid, sid = body["account_id"], body["session_id"]
         action, rid = body["action"], body["request_id"]
         if (type(aid) is not int or aid < 1 or not isinstance(sid, str) or not sid
+                or not isinstance(action, str)
                 or not isinstance(rid, str) or re.fullmatch(r"[a-f0-9]{32}", rid) is None):
             _reject("INVALID_REQUEST", "无效的游戏辅助请求", 400)
         params = {"action": action}
-        if action == "configure" and type(body.get("pickup")) is bool and set(body) == {
+        common = {"account_id", "session_id", "action", "request_id"}
+        if action == "adventure-status" and set(body) == common:
+            pass
+        elif action in ADVENTURE_TARGETS and set(body) == common | {"target"}:
+            target = body["target"]
+            match = ADVENTURE_TARGETS[action].fullmatch(target) if isinstance(target, str) else None
+            if match is None:
+                _reject("INVALID_REQUEST", "无效的探险记请求", 400)
+            params["adventure_target"] = match.groups()
+        elif action == "configure" and type(body.get("pickup")) is bool and set(body) == {
                 "account_id", "session_id", "action", "request_id", "pickup"}:
             params["pickup"] = body["pickup"]
         elif action in DOOR_ACTIONS and set(body)=={"account_id","session_id","action","request_id","target"}:
@@ -185,7 +248,7 @@ def install(game, handlers, live_contexts):
         if len(contexts) != 1:
             _reject("SESSION_NOT_READY", "请先进入游戏角色")
         context = contexts[0]
-        if action == "configure":
+        if action == "configure" or action in ADVENTURE_ACTIONS:
             params["connection_generation"] = context.generation
         elif action not in DOOR_ACTIONS and body["target"].split("/", 1)[0] != str(context.generation):
             _reject("TARGET_CHANGED", "游戏连接已改变，请稍后重试")

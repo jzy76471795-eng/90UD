@@ -54,6 +54,7 @@ class _Room:
     actor_base: int
     templates: object = None
     entities: tuple = ()
+    personal_sequences: set = field(default_factory=set)
 
 
 class SharedRunWorld:
@@ -154,6 +155,8 @@ class SharedRunWorld:
         if view is None:
             rows = (list(getattr(session, 'dungeon_room_mons', ()) or ()),
                     list(getattr(session, 'dungeon_room_passive_objects', ()) or ()))
+            personal = [row for row in rows[0] if row.get('personal_quest_actor')]
+            rows = ([row for row in rows[0] if not row.get('personal_quest_actor')], rows[1])
             if room.templates is None:
                 entities = []
                 for group in rows:
@@ -174,6 +177,19 @@ class SharedRunWorld:
                 for row, entity in zip(rows[0] + rows[1], room.entities):
                     row['killed'] = entity.dead
             bindings = {id(row): (row, entity) for row, entity in zip(rows[0] + rows[1], room.entities)}
+            if personal:
+                reserved = {row.get('seq') for row in rows[0]} | room.personal_sequences
+                free = (seq for seq in range(base + 255, base, -1) if seq not in reserved)
+                for row in personal:
+                    seq = next(free, None)
+                    if seq is None:
+                        raise BridgeError('personal quest actor range exhausted')
+                    row['seq'] = seq
+                    room.personal_sequences.add(seq)
+                    entity = _Entity(SharedActorIdentity(self, key, row['code'], row['type'],
+                                                        seq, bool(row.get('wire_visible', True))))
+                    rows[0].append(row)
+                    bindings[id(row)] = (row, entity)
             view = self._views[view_key] = (rows, bindings)
         else:
             # Re-entry projects authoritative deaths into the existing view.

@@ -69,6 +69,8 @@ class QuestCompletionTicketRule:
         cls,
         action_type: str,
         action_values: tuple[int, ...] | list[int] = (),
+        *,
+        allow_cn_earring: bool = False,
     ) -> "QuestCompletionTicketRule | None":
         action = _normalize_tag(action_type)
         values = tuple(int(value) for value in (action_values or ()))
@@ -99,7 +101,7 @@ class QuestCompletionTicketRule:
             )
             if not quest_ids or len(quest_ids) != len(values):
                 return None
-            if quest_ids in UNSUPPORTED_ANY_QUEST_CLEAR_SETS:
+            if quest_ids in UNSUPPORTED_ANY_QUEST_CLEAR_SETS and not allow_cn_earring:
                 return None
             return cls(
                 action_type=action,

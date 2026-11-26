@@ -135,10 +135,57 @@ def install_game(game):
         packets,count=snapshot_packets(game,session)
         return packets,{'mail_count':count},'native mailbox refreshed'
 
+    def adventure_season1_status(params, session):
+        if params:
+            raise ControlApiError("INVALID_PARAMS", "赛季状态不接收参数", status=400)
+        from game.quest.adventure_season1 import status
+        try:
+            state = status(game, session)
+        except ValueError as exc:
+            raise ControlApiError("SEASON1_STATUS_ERROR", str(exc), status=409) from exc
+        return [], {"active": state is not None, "season": state}, "adventure season 1 status"
+
+    def adventure_season1_complete(params, session):
+        if set(params) != {"period", "bucket", "mission_id"}:
+            raise ControlApiError("INVALID_PARAMS", "需要指定赛季任务", status=400)
+        from game.quest.adventure_season1 import complete_mission
+        try:
+            completed = complete_mission(game, session, params["period"], params["bucket"], params["mission_id"])
+        except ValueError as exc:
+            raise ControlApiError("SEASON1_COMPLETE_ERROR", str(exc), status=409) from exc
+        return [], {"completed": completed}, "adventure season 1 mission completion"
+
+    def adventure_season1_claim(params, session):
+        if set(params) != {"level"}:
+            raise ControlApiError("INVALID_PARAMS", "需要指定奖励等级", status=400)
+        from game.quest.adventure_season1 import claim_basic_reward
+        try:
+            delivered = claim_basic_reward(game, session, params["level"])
+        except ValueError as exc:
+            raise ControlApiError("SEASON1_CLAIM_ERROR", str(exc), status=409) from exc
+        return [], {"delivered": delivered}, "adventure season 1 basic claim"
+
+    native_handlers["adventure_season1.status"] = adventure_season1_status
+    native_handlers["adventure_season1.complete"] = adventure_season1_complete
+    native_handlers["adventure_season1.claim_basic"] = adventure_season1_claim
+
+    def adventure_season1_claim_all(params, session):
+        if params:
+            raise ControlApiError("INVALID_PARAMS", "全部领取不接收参数", status=400)
+        from game.quest.adventure_season1 import claim_all_basic_rewards
+        try:
+            levels = claim_all_basic_rewards(game, session)
+        except ValueError as exc:
+            raise ControlApiError("SEASON1_CLAIM_ERROR", str(exc), status=409) from exc
+        return [], {"claimed_levels": levels}, "adventure season 1 basic claim all"
+
+    native_handlers["adventure_season1.claim_all_basic"] = adventure_season1_claim_all
     native_handlers["manager.mailbox_refresh"] = refresh_mailbox
     native_handlers["manager.claim_mail"] = claim_mail
     from game import player_assist
     player_assist.install(game, native_handlers, live_contexts)
+    from game.character import cn2018_operations
+    cn2018_operations.install(game, native_handlers, live_contexts)
     for name, handler in native_handlers.items():
         game._control_handlers[name] = wrap_handler(handler)
 

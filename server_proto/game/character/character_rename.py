@@ -2,7 +2,7 @@
 from __future__ import annotations
 import os,sqlite3,struct,time
 from pathlib import Path
-from game.character.character_db import is_valid_character_name,CHARACTER_NAME_MAX_BYTES
+from game.character.character_db import CHARACTER_NAME_MAX_BYTES, is_valid_character_name, is_valid_new_character_name
 
 DAY=86400
 CN_CARD=2682290
@@ -61,6 +61,7 @@ def parse_change(body):
    if not is_valid_character_name(text) or '\0' in text:return None
    values.append(text)
   if pos>=len(raw) or len(raw)>pos+16 or any(raw[pos+1:]):return None
+  if not is_valid_new_character_name(values[1]):return None
   return dict(slot=raw[0],old_name=values[0],new_name=values[1],client_reason=raw[pos])
  except (UnicodeError,struct.error):return None
 
@@ -96,7 +97,7 @@ def activate(repo,account_id,character_id,slot,*,metadata_resolver,now=None):
 
 def complete(repo,account_id,parsed,*,metadata_resolver,now=None):
  now=int(time.time()) if now is None else int(now)
- if account_id<=0 or parsed is None:return False,'invalid_request',{}
+ if account_id<=0 or parsed is None or not is_valid_new_character_name(parsed['new_name']):return False,'invalid_request',{}
  records=repo.list_by_account(account_id)
  record=records[parsed['slot']] if 0<=parsed['slot']<len(records) else None
  if record is None:return False,'character_account_mismatch',{}

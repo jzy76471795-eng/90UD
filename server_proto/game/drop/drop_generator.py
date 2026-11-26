@@ -168,6 +168,7 @@ def generate_hell_party_drops(
     independent_drop_rate_bonus_percent: int = 0,
     include_independent_drop: bool = True,
     include_group_reward: bool = True,
+    epic_piece_bonus_count: int = 0,
 ) -> Tuple[MonsterDropResult, int]:
     """Generate PVF Hell Party independent drops plus one group reward.
 
@@ -204,6 +205,8 @@ def generate_hell_party_drops(
     fragment_rolls = (
         max(0, int(reward_roll_count)) if bool(include_group_reward) else 0
     )
+    if fragment_rolls:
+        fragment_rolls += max(0, int(epic_piece_bonus_count))
     allow = allow_item or _allow_configured_item
     seed_before = int(lcg.seed)
     slot = int(slot_counter) & 0xFFFF

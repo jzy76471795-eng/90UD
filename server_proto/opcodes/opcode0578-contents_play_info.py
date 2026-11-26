@@ -344,7 +344,23 @@ class ContentsPlayInfo0578Service:
             )
             for product in feature_index.shop_products
         )
-        if not read_only and profile_account_id is None and session is not None and (
+        if read_only and profile_account_id is not None:
+            from game.character import cn2018_shop
+            from game.character.cn2018_expedition import CN2018Expedition
+            from pvf.cn_expedition_index import get_cn_expedition_index
+            if cn2018_shop.enabled():
+                try:
+                    collection = CN2018Expedition(repo, get_cn_expedition_index()).collection_view(account_id)
+                    # The peer UI needs the registered branch and badge alone.
+                    # Store the badge as rank + 1 so a missing entry stays 0.
+                    marker = 0x7FCF0200
+                    shop_rows += ((marker, 1),) + tuple(
+                        (marker + 1 + row["job"] * 8 + row["branch"], min(row["expertise_level"] // 10, 5) + 1)
+                        for row in collection if row["registered"]
+                    )
+                except (KeyError, FileNotFoundError, ValueError):
+                    pass
+        elif not read_only and profile_account_id is None and session is not None and (
             int(getattr(session, "account_id", 0) or 0) == account_id
             and getattr(session, "login_session_id", None)
         ):

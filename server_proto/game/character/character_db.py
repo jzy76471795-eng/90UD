@@ -607,6 +607,10 @@ def is_valid_character_name(name: str) -> bool:
     )
 
 
+def is_valid_new_character_name(name: str) -> bool:
+    return is_valid_character_name(name) and '?' not in name and '\ufffd' not in name
+
+
 def _looks_like_character_name(raw: bytes) -> bool:
     if not raw:
         return False
@@ -671,7 +675,7 @@ def parse_create_character_body(body: bytes) -> ParsedCreateCharacter | None:
         name_raw = candidate[5 : 5 + name_len]
         if not _looks_like_character_name(name_raw):
             continue
-        if not is_valid_character_name(name_raw.decode("utf-8")):
+        if not is_valid_new_character_name(name_raw.decode("utf-8")):
             continue
         return ParsedCreateCharacter(
             job=job,
@@ -697,7 +701,7 @@ def parse_check_name_body(body: bytes) -> tuple[str, bytes, str] | None:
         name_raw = candidate[4 : 4 + name_len]
         if not _looks_like_character_name(name_raw):
             continue
-        if not is_valid_character_name(name_raw.decode("utf-8")):
+        if not is_valid_new_character_name(name_raw.decode("utf-8")):
             continue
         return name_raw.decode("utf-8"), name_raw, source
     return None
@@ -892,6 +896,22 @@ class CharacterRepository:
         return self.open()
 
     @contextmanager
+    def _begin_progression_write(self):
+        with self._open_progression_transaction() as conn:
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
+                yield conn
+                return
+            conn.execute("SAVEPOINT character_progression")
+            try:
+                yield conn
+            except BaseException:
+                conn.execute("ROLLBACK TO SAVEPOINT character_progression")
+                raise
+            finally:
+                conn.execute("RELEASE SAVEPOINT character_progression")
+
+    @contextmanager
     def game_connection_scope(self):
         """Reuse one SQLite connection for all repository calls on a Game thread."""
         existing = getattr(self._game_connection, "state", None)
@@ -935,7 +955,6 @@ class CharacterRepository:
                 state.connection.close()
                 del self._progression_connection.state
 
-    @contextmanager
     def inventory_transaction_scope(self):
         """Run nested inventory repository calls in one immediate transaction.
 
@@ -944,10 +963,15 @@ class CharacterRepository:
         this connection so every nested mutation commits or rolls back as one
         unit while still reusing the Game thread's long-lived connection.
         """
+        return self._borrowed_write_transaction()
+
+    @contextmanager
+    def _borrowed_write_transaction(self):
+        """Keep nested repository operations on the same write transaction."""
         self._ensure_schema()
         with self.open() as conn:
             owns_transaction = not conn.in_transaction
-            savepoint = "usdof_inventory_transaction"
+            savepoint = "usdof_repository_transaction"
             if owns_transaction:
                 conn.execute("BEGIN IMMEDIATE")
             else:
@@ -3272,6 +3296,8 @@ class CharacterRepository:
                     "VALUES (?, ?, ?, ?, ?)",
                     (aid, area, points, now, finish),
                 )
+                from game.quest.adventure_season1 import record_game_actions
+                record_game_actions(conn, aid, "expedition_start", (f"{area}:{now}",), now=now)
                 state = {
                     "dispatch_state": 1,
                     "area_index": area,
@@ -4048,15 +4074,21 @@ class CharacterRepository:
             ).fetchall()
         return {str(row[0]): int(row[1]) for row in rows}
 
-    def record_hundred_floor_tower_entry(self, account_id: int, tower_kind: str, entry_day: str) -> None:
+    def record_hundred_floor_tower_entry(
+        self, account_id: int, tower_kind: str, entry_day: str, *, limit: int | None = None,
+    ) -> bool:
         kind = self._normalize_hundred_floor_tower_kind(tower_kind)
+        if limit is not None and limit <= 0:
+            return False
         with self.open() as conn:
-            conn.execute(
+            updated = conn.execute(
                 "INSERT INTO account_hundred_floor_tower_entry_day "
                 "(account_id, tower_kind, entry_day, entries) VALUES (?, ?, ?, 1) "
-                "ON CONFLICT(account_id, tower_kind, entry_day) DO UPDATE SET entries = entries + 1",
-                (int(account_id), kind, entry_day),
+                "ON CONFLICT(account_id, tower_kind, entry_day) "
+                "DO UPDATE SET entries = entries + 1 WHERE (? IS NULL OR entries < ?)",
+                (int(account_id), kind, entry_day, limit, limit),
             )
+            return updated.rowcount == 1
 
     def get_account_special_dungeon_highest_unlocked(
         self,
@@ -5720,6 +5752,7 @@ class CharacterRepository:
         *,
         flag_value: int = 1,
         daily_completed_on: str | None = None,
+        count_for_adventure: bool = False,
     ) -> tuple[bool, str]:
         """Persist a finished task and, for dailies, its server-day completion."""
         self._ensure_schema()
@@ -5731,7 +5764,7 @@ class CharacterRepository:
             flag = 1
         with self.open() as conn:
             parent = conn.execute(
-                "SELECT 1 FROM characters WHERE character_id = ? AND delete_flag = 0",
+                "SELECT account_id FROM characters WHERE character_id = ? AND delete_flag = 0",
                 (cid,),
             ).fetchone()
             if parent is None:
@@ -5750,10 +5783,18 @@ class CharacterRepository:
                     "completed_on = excluded.completed_on, updated_at = CURRENT_TIMESTAMP",
                     (cid, qid, day_key),
                 )
+            completion = conn.execute(
+                "SELECT accepted_at FROM character_active_quests WHERE character_id = ? AND quest_id = ?",
+                (cid, qid),
+            ).fetchone() if count_for_adventure else None
             conn.execute(
                 "DELETE FROM character_active_quests WHERE character_id = ? AND quest_id = ?",
                 (cid, qid),
             )
+            if completion is not None:
+                from game.quest.adventure_season1 import record_game_actions
+                operation = f"{cid}:{qid}:{completion[0]}:{day_key}"
+                record_game_actions(conn, int(parent[0]), "quest_complete", (operation,))
             detail = f"finished quest_id={qid} flag={flag}"
             if day_key:
                 detail = f"{detail} daily_completed_on={day_key}"
@@ -6270,71 +6311,56 @@ class CharacterRepository:
         character_id: int,
         *,
         page: int | None = None,
+        expected_job: int | None = None,
     ) -> list[dict[str, Any]]:
-        """读取 character_skills；按 page_index, slot 排序。
+        """Read learned skills for the persisted job and growth branch.
 
-        每行: page_index, page_header, slot, skill_id, level, extra_values(bytes|None)
+        The job, skill rows and command overrides share one SQLite snapshot.
+        Legacy rows with an illegal skill ID are excluded from projections.
         """
+        from game.chain_loader import load_chain
+
         self._ensure_schema()
         cid = int(character_id)
+        options = ["s.character_id = ?", "c.delete_flag = 0", "s.slot >= 0"]
+        args = [cid]
+        if page is not None:
+            options.append("s.page_index = ?")
+            args.append(int(page) & 0xFF)
+        if expected_job is not None:
+            options.append("c.job = ?")
+            args.append(int(expected_job) & 0xFF)
         with self.open() as conn:
-            if page is None:
-                rows = conn.execute(
-                    "SELECT page_index, page_header, slot, skill_id, level, extra_values "
-                    "FROM character_skills WHERE character_id = ? "
-                    "ORDER BY page_index, slot",
-                    (cid,),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT page_index, page_header, slot, skill_id, level, extra_values "
-                    "FROM character_skills WHERE character_id = ? AND page_index = ? "
-                    "ORDER BY slot",
-                    (cid, int(page) & 0xFF),
-                ).fetchall()
-        # 独立命令库优先：01EC 后非基线技能曾被删，命令仍在 store 里
-        cmd_store: dict[int, bytes] = {}
-        try:
-            with self.open() as conn:
-                self._ensure_skill_command_store(conn)
-                store_rows = conn.execute(
-                    "SELECT skill_id, command_bytes FROM character_skill_commands "
-                    "WHERE character_id = ?",
-                    (cid,),
-                ).fetchall()
-            for srow in store_rows:
-                sid_s = int(srow["skill_id"] or 0) & 0xFFFF
-                blob_s = srow["command_bytes"]
-                if sid_s > 0 and blob_s is not None:
-                    try:
-                        data_s = bytes(blob_s)
-                    except Exception:
-                        continue
-                    if data_s:
-                        cmd_store[sid_s] = data_s
-        except Exception:
-            cmd_store = {}
+            rows = conn.execute(
+                "SELECT s.page_index, s.page_header, s.slot, s.skill_id, s.level, "
+                "COALESCE(NULLIF(k.command_bytes, X''), s.extra_values) AS extra_values, "
+                "c.job, c.grow_type "
+                "FROM character_skills s JOIN characters c ON c.character_id = s.character_id "
+                "LEFT JOIN character_skill_commands k ON k.character_id = s.character_id "
+                "AND k.skill_id = s.skill_id "
+                "WHERE " + " AND ".join(options) + " ORDER BY s.page_index, s.slot",
+                tuple(args),
+            ).fetchall()
+        if not rows:
+            return []
 
+        job, grow_type = int(rows[0]["job"] or 0), int(rows[0]["grow_type"] or 0)
+        catalog = load_chain("helper-skill_data.py")
+        grants = catalog.skill_growth_grants(job, grow_type)
         out: list[dict[str, Any]] = []
         for row in rows:
-            slot = int(row["slot"])
-            if slot < 0:
-                # 交换中间态残留，正常路径不应出现
+            sid = int(row["skill_id"] or 0)
+            if not 0 < sid <= 0xFFFF or not catalog.skill_allowed_for_growth(job, grow_type, sid, grants):
                 continue
-            sid = int(row["skill_id"] or 0) & 0xFFFF
-            extra = None
-            if sid in cmd_store:
-                extra = cmd_store[sid]
-            elif row["extra_values"] is not None:
-                extra = bytes(row["extra_values"])
+            extra = row["extra_values"]
             out.append(
                 {
                     "page_index": int(row["page_index"]) & 0xFF,
                     "page_header": int(row["page_header"] or 0) & 0xFFFF,
-                    "slot": slot & 0xFF,
+                    "slot": int(row["slot"]) & 0xFF,
                     "skill_id": sid,
                     "level": max(0, int(row["level"] or 0)) & 0xFF,
-                    "extra_values": extra,
+                    "extra_values": None if extra is None else bytes(extra),
                 }
             )
         return out
@@ -6346,19 +6372,17 @@ class CharacterRepository:
         *,
         page: int = 0,
         page_header: int = 0,
+        expected_job: int | None = None,
     ) -> int:
-        """若该角色尚无技能行，按 skills 灌入 page0（默认）。
+        """Seed a page that has no skills usable by the character's current job."""
+        from game.chain_loader import load_chain
 
-        skills: 可迭代对象，元素需有 slot / skill_id / level。
-        返回插入行数；已有数据时返回 0。
-        """
-        self._ensure_schema()
         cid = int(character_id)
         if cid <= 0:
             return 0
         page_i = 0 if int(page) != 1 else 1
         header = int(page_header) & 0xFFFF
-        entries: list[tuple[int, int, int]] = []
+        entries: dict[int, tuple[int, int]] = {}
         for item in skills or ():
             try:
                 skill_id = int(getattr(item, "skill_id", 0) or 0) & 0xFFFF
@@ -6368,30 +6392,42 @@ class CharacterRepository:
                 continue
             if skill_id <= 0 or level <= 0:
                 continue
-            entries.append((slot, skill_id, level))
+            entries.setdefault(slot, (skill_id, level))
         if not entries:
             return 0
-        with self.open() as conn:
-            existing = conn.execute(
-                "SELECT COUNT(*) AS n FROM character_skills WHERE character_id = ?",
+        with self._borrowed_write_transaction() as conn:
+            character = conn.execute(
+                "SELECT job, grow_type FROM characters WHERE character_id = ? AND delete_flag = 0",
                 (cid,),
             ).fetchone()
-            if int(existing["n"] if existing is not None else 0) > 0:
+            if character is None:
                 return 0
-            inserted = 0
-            for slot, skill_id, level in entries:
-                try:
-                    conn.execute(
-                        "INSERT INTO character_skills "
-                        "(character_id, page_index, page_header, slot, skill_id, level, extra_values) "
-                        "VALUES (?, ?, ?, ?, ?, ?, NULL)",
-                        (cid, page_i, header, slot, skill_id, level),
-                    )
-                    inserted += 1
-                except sqlite3.IntegrityError:
-                    # 同页同槽重复：保留首条
-                    continue
-            return inserted
+            job, grow_type = int(character["job"] or 0), int(character["grow_type"] or 0)
+            if expected_job is not None and job != (int(expected_job) & 0xFF):
+                return 0
+            if self.load_character_skills(cid, page=page_i):
+                return 0
+
+            catalog = load_chain("helper-skill_data.py")
+            grants = catalog.skill_growth_grants(job, grow_type)
+            defaults = [
+                (cid, page_i, header, slot, sid, level)
+                for slot, (sid, level) in entries.items()
+                if catalog.skill_allowed_for_growth(job, grow_type, sid, grants)
+            ]
+            # With no usable skills on this page, only legacy rows can occupy its default slots.
+            written = conn.executemany(
+                "INSERT INTO character_skills "
+                "(character_id, page_index, page_header, slot, skill_id, level, extra_values) "
+                "VALUES (?, ?, ?, ?, ?, ?, NULL) "
+                "ON CONFLICT(character_id, page_index, slot) DO UPDATE SET "
+                "page_header = excluded.page_header, skill_id = excluded.skill_id, "
+                "level = excluded.level, extra_values = NULL",
+                defaults,
+            ).rowcount
+            if written != len(defaults):
+                raise RuntimeError("incomplete default skill page seed")
+            return int(written)
 
     def swap_character_skill_slot(
         self,
@@ -6730,6 +6766,42 @@ class CharacterRepository:
             )
             return int(cur.rowcount or 0)
 
+    def replace_base_job_skill_state(
+        self,
+        character_id: int,
+        *,
+        job: int,
+        skills: Any,
+        total_sp: int,
+        remaining_sp: int,
+        total_tp: int,
+        remaining_tp: int,
+        synced_level: int,
+    ) -> bool:
+        """Commit the new job, tree, commands and points together."""
+        entries = tuple(skills)
+        with self._borrowed_write_transaction() as conn:
+            original = conn.execute(
+                "SELECT job FROM characters WHERE character_id = ? AND delete_flag = 0",
+                (character_id,),
+            ).fetchone()
+            if original is None:
+                return False
+            same_job = int(original["job"] or 0) == job
+            if not self.update_character_job_and_grow_type(character_id, job=job, grow_type=0):
+                raise RuntimeError("character job update failed")
+            if not same_job:
+                self.clear_all_character_skill_commands(character_id)
+            inserted = self.replace_character_skills(character_id, entries, preserve_commands=same_job)
+            if inserted != len(entries):
+                raise RuntimeError("incomplete replacement skill tree")
+            if not self.upsert_character_skill_points(
+                character_id, total_sp=total_sp, remaining_sp=remaining_sp,
+                total_tp=total_tp, remaining_tp=remaining_tp, synced_level=synced_level,
+            ):
+                raise RuntimeError("skill points update failed")
+        return True
+
     def replace_character_skills(
         self,
         character_id: int,
@@ -7052,8 +7124,7 @@ class CharacterRepository:
             )
 
         try:
-            with self._open_progression_transaction() as conn:
-                conn.execute("BEGIN IMMEDIATE")
+            with self._begin_progression_write() as conn:
                 row = conn.execute(
                     "SELECT account_id, exp, expertise_exp, gold, level "
                     "FROM characters WHERE character_id = ? AND delete_flag = 0",
@@ -7209,6 +7280,10 @@ class CharacterRepository:
                         cid,
                     ),
                 )
+                if old_level >= 90 and exp_d and os.environ.get("USDOF_CN2018_SHOP") == "1":
+                    from game.character.cn2018_capsule import accumulate_tx
+
+                    accumulate_tx(conn, int(row["account_id"]), exp_d)
                 if source_spec is not None:
                     if source_remaining <= 0:
                         conn.execute(
@@ -9580,6 +9655,9 @@ class CharacterRepository:
                         (new_option, target_uid),
                     )
 
+                from game.quest.adventure_season1 import record_equipment_upgrade
+
+                record_equipment_upgrade(conn, aid, amplified=False, successful_level=0)
                 detail = {
                     "account_id": aid,
                     "character_id": cid,
@@ -10027,6 +10105,13 @@ class CharacterRepository:
                         ),
                     )
 
+                if not is_ticket_attempt:
+                    from game.quest.adventure_season1 import record_equipment_upgrade
+
+                    record_equipment_upgrade(
+                        conn, aid, amplified=expected_amp_type is not None,
+                        successful_level=final_level if outcome == 0 else 0,
+                    )
                 changed_slots = {target, material_slot_i}
                 if has_protection:
                     changed_slots.add(protection_slot_i)
@@ -12149,6 +12234,7 @@ class CharacterRepository:
         material_count: int = 0,
         enforce_reward_job_restrictions: bool = True,
         gold_reward: int = 0,
+        gold_cost: int = 0,
         activate_system_rewards: bool = True,
         now_unix: int | None = None,
     ) -> tuple[bool, str, dict[str, Any]]:
@@ -12166,6 +12252,7 @@ class CharacterRepository:
         slot = int(source_slot)
         package_id = int(expected_package_item_id) & 0xFFFFFFFF
         gold_quantity = int(gold_reward)
+        gold_price = int(gold_cost)
         activation_now = (
             int(time.time()) if now_unix is None else max(0, int(now_unix))
         )
@@ -12173,6 +12260,8 @@ class CharacterRepository:
             return False, "invalid_owner_source_or_package", {}
         if gold_quantity < 0 or gold_quantity > 0xFFFFFFFF:
             return False, "invalid_gold_reward", {}
+        if not 0 <= gold_price <= 0xFFFFFFFF:
+            return False, "invalid_gold_cost", {}
         if grants and gold_quantity:
             return False, "mixed_item_and_gold_rewards_unsupported", {}
         if not grants and not gold_quantity:
@@ -12319,10 +12408,10 @@ class CharacterRepository:
                 wallet = self._currency_wallet_tx(conn, cid)
                 gold_before = int(wallet["gold"])
                 revive_coin_before = int(wallet["revive_coin"])
-                if (
-                    gold_quantity
-                    and gold_before > CHARACTER_WALLET_STORAGE_MAX - gold_quantity
-                ):
+                if gold_before < gold_price:
+                    return False, "gold_insufficient", {}
+                gold_after = gold_before - gold_price + gold_quantity
+                if gold_after > CHARACTER_WALLET_STORAGE_MAX:
                     return False, "wallet_gold_overflow", {}
                 self._project_account_wallet_tx(conn, cid, wallet)
                 rows = conn.execute(
@@ -12448,7 +12537,7 @@ class CharacterRepository:
                 }
                 if material_row is not None:
                     changed_slots[self.INVENTORY_LIST_MAIN].add(material_slot_value)
-                if gold_quantity:
+                if gold_after != gold_before:
                     changed_slots[self.INVENTORY_LIST_MAIN].add(0)
                 new_rows: list[_InventoryGrantRowPlan] = []
                 grant_details: list[dict[str, Any]] = []
@@ -12946,8 +13035,8 @@ class CharacterRepository:
                         "UPDATE accounts SET %s = ? WHERE account_id = ?" % cube_col,
                         (int(final_count), aid),
                     )
-                if gold_quantity:
-                    wallet["gold"] = gold_before + gold_quantity
+                if gold_after != gold_before:
+                    wallet["gold"] = gold_after
                     conn.execute(
                         "UPDATE character_wallets SET gold = ?, "
                         "updated_at = CURRENT_TIMESTAMP WHERE character_id = ?",
@@ -20976,10 +21065,11 @@ class CharacterRepository:
         删除后会把同账号剩余角色槽位收口为连续 ``0..n-1``，避免客户端按稠密 UI
         序号删角时撞到错误的 slot 占用者。
         """
+        from game.quest.weekly_attendance import migrate_reward_ledger
+
         cid = int(character_id)
-        with self.open() as conn:
-            # 确保外键级联生效(大多数子表是 ON DELETE CASCADE)。
-            conn.execute("PRAGMA foreign_keys = ON;")
+        with self.inventory_transaction_scope() as conn:
+            migrate_reward_ledger(conn)
             # 先手动清理未声明级联的子表。
             for table in self._NON_CASCADE_CHILD_TABLES:
                 try:
@@ -21643,7 +21733,6 @@ class CharacterRepository:
         extra = sqlite3.Binary(data) if data else None
         affected = 0
         with self.open() as conn:
-            self._ensure_skill_command_store(conn)
             if data:
                 conn.execute(
                     "INSERT INTO character_skill_commands "
@@ -21678,6 +21767,31 @@ class CharacterRepository:
                 )
             affected += int(cur.rowcount or 0)
         return affected
+
+    def save_owned_skill_commands(
+        self, account_id: int, character_id: int, records: Any, *, persist: bool = True
+    ) -> int | None:
+        """Validate the whole command batch against the same job used for the write."""
+        from game.chain_loader import load_chain
+
+        catalog = load_chain("helper-skill_data.py")
+        with self._borrowed_write_transaction() as conn:
+            owner = conn.execute(
+                "SELECT job, grow_type FROM characters "
+                "WHERE account_id = ? AND character_id = ? AND delete_flag = 0",
+                (account_id, character_id),
+            ).fetchone()
+            if owner is None:
+                return None
+            job, grow_type = int(owner["job"] or 0), int(owner["grow_type"] or 0)
+            grants = catalog.skill_growth_grants(job, grow_type)
+            if any(not catalog.skill_allowed_for_growth(job, grow_type, sid, grants)
+                   for sid, _ in records):
+                return None
+            if not persist:
+                return 0
+            return sum(self.update_character_skill_command(character_id, sid, cmd)
+                       for sid, cmd in records)
 
     def clear_all_character_skill_commands(self, character_id: int) -> int:
         """清空角色全部技能释放命令（C1/014C ALL_DEFAULT）。
@@ -22156,6 +22270,18 @@ class CharacterRepository:
                 CREATE TABLE IF NOT EXISTS account_cn2018_pure (
                     account_id INTEGER PRIMARY KEY REFERENCES accounts(account_id) ON DELETE CASCADE,
                     balance INTEGER NOT NULL CHECK (balance >= 0)
+                );
+                CREATE TABLE IF NOT EXISTS account_cn2018_capsules (
+                    account_id INTEGER PRIMARY KEY REFERENCES accounts(account_id) ON DELETE CASCADE,
+                    week_key INTEGER NOT NULL,
+                    stored_exp INTEGER NOT NULL CHECK (stored_exp >= 0)
+                );
+                CREATE TABLE IF NOT EXISTS account_cn2018_capsule_uses (
+                    account_id INTEGER NOT NULL REFERENCES accounts(account_id) ON DELETE CASCADE,
+                    request_id INTEGER NOT NULL,
+                    character_id INTEGER NOT NULL,
+                    quantity INTEGER NOT NULL CHECK (quantity > 0),
+                    PRIMARY KEY (account_id, request_id)
                 );
                 CREATE TABLE IF NOT EXISTS account_cn2018_shop_purchases (
                     account_id INTEGER NOT NULL REFERENCES accounts(account_id) ON DELETE CASCADE,

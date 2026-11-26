@@ -88,6 +88,26 @@
           "release": "combined-native-compat-20261122-player-logs",
           "bytes": 201728,
           "sha256": "9d18be7a182b5277df2c351b1642228805d638cdfda77d144dad27e675d0e1d0"
+        },
+        {
+          "release": "chat-hotkey-focus-20261125",
+          "bytes": 204288,
+          "sha256": "52e59f36b08a6cd8c4a20c8163b8cfba8f363a9d740d4bc108d61a22d4db8bc8"
+        },
+        {
+          "release": "chat-cn-native-return-20261126",
+          "bytes": 205312,
+          "sha256": "78912331cb361e99d4e448a8683472577691fdaa36e9c62908b445d37917cb0c"
+        },
+        {
+          "release": "chat-cn-preedit-release-20261126",
+          "sha256": "8b3013dcb57149cf3ad7bf5aa2ee5e1f232ea7eadcc17cba2fcde609a84fe0c8",
+          "bytes": 206336
+        },
+        {
+          "release": "unicode-packet-frame-20261126",
+          "sha256": "7a593d3682b7ad1aa163fd21044103bba26abd2f82e7064a0e7f8cf2057cfb23",
+          "bytes": 207360
         }
       ]
     },

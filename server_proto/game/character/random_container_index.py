@@ -2,8 +2,8 @@
 
 The frozen Stage3 client uses two request families for these containers:
 
-* C1/001B for ``[legacy]`` and ``[upgradable legacy]`` items whose rewards
-  are stored in ``[int data]``.
+* C1/001B for ``[legacy]``, ``[upgradable legacy]`` and ``[monster tarot card]``
+  items whose rewards are stored in ``[int data]``.
 * C1/00D0 for ``[multi upgradable legacy]`` boxes whose independent reward
   groups and optional material cost are stored below ``[random]``.
 
@@ -28,6 +28,8 @@ from pvf import pvf_runtime
 STACKABLE_LIST_PATH = "stackable/stackable.lst"
 EQUIPMENT_LOTTERY_TYPE = "[upgradable legacy]"
 ITEM_LOTTERY_TYPE = "[legacy]"
+MONSTER_TAROT_TYPE = "[monster tarot card]"
+LOTTERY_TYPES = (EQUIPMENT_LOTTERY_TYPE, ITEM_LOTTERY_TYPE, MONSTER_TAROT_TYPE)
 RANDOM_BOX_TYPE = "[multi upgradable legacy]"
 RANDOM_BOX_GROUP_NAMES = frozenset(("monthly item", "default list", "random list"))
 RANDOM_BOX_CHILD_NAMES = RANDOM_BOX_GROUP_NAMES | frozenset(("sealing removal item",))
@@ -262,6 +264,7 @@ class LotteryContainerDefinition:
     reward_kind: str
     candidates: tuple[RandomRewardCandidate, ...]
     source_path: str = ""
+    gold_cost: int = 0
 
     def roll(
         self,
@@ -360,7 +363,8 @@ def parse_lottery_container_text(
     normalized_type = _normalize_label(stackable_type)
     if item_id <= 0:
         raise ValueError("invalid lottery source item=%r" % source_item_id)
-    if normalized_type == EQUIPMENT_LOTTERY_TYPE:
+    gold_cost = 0
+    if normalized_type in (EQUIPMENT_LOTTERY_TYPE, MONSTER_TAROT_TYPE):
         stride = 3
         reward_kind = "equipment"
     elif normalized_type == ITEM_LOTTERY_TYPE:
@@ -368,6 +372,11 @@ def parse_lottery_container_text(
         reward_kind = "item"
     else:
         raise ValueError("unsupported lottery type item=%d type=%r" % (item_id, stackable_type))
+    if normalized_type == MONSTER_TAROT_TYPE:
+        cost = _first_section_token(text, "lottery use cost")
+        gold_cost = _parse_int(cost, context=f"tarot gold cost source={item_id}")
+        if not 1 <= gold_cost <= 0xFFFFFFFF:
+            raise ValueError(f"invalid tarot gold cost source={item_id} cost={gold_cost}")
 
     sections = _section_token_groups(text, "int data")
     if not sections:
@@ -397,6 +406,7 @@ def parse_lottery_container_text(
         reward_kind=reward_kind,
         candidates=_validate_candidate_values(item_id, candidates, group_name="int data"),
         source_path=str(source_path or ""),
+        gold_cost=gold_cost,
     )
 
 
@@ -593,7 +603,7 @@ def _load_index_from_shared_reader() -> RandomContainerIndex:
     for item_id, source_path in entries:
         text = pvf_runtime.read_text(source_path)
         stackable_type = _first_section_token(text, "stackable type")
-        if stackable_type not in (EQUIPMENT_LOTTERY_TYPE, ITEM_LOTTERY_TYPE, RANDOM_BOX_TYPE):
+        if stackable_type not in (*LOTTERY_TYPES, RANDOM_BOX_TYPE):
             continue
         try:
             if stackable_type == RANDOM_BOX_TYPE:
@@ -667,7 +677,7 @@ def _load_single_container(
                 )
             )
             return None, definition, int(filtered)
-        if stackable_type in (EQUIPMENT_LOTTERY_TYPE, ITEM_LOTTERY_TYPE):
+        if stackable_type in LOTTERY_TYPES:
             definition, filtered = _sanitize_lottery_definition(
                 parse_lottery_container_text(
                     template_id,

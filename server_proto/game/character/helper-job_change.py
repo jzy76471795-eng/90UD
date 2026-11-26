@@ -611,28 +611,11 @@ def apply_base_job_change(
     if repo is None or cid <= 0:
         return JobChangeResult(False, previous_grow, previous_grow, 0, 0, note="no_repo_or_cid")
     try:
-        rows = int(
-            repo.update_character_job_and_grow_type(
-                cid,
-                job=job_i,
-                grow_type=0,
-            )
-            or 0
-        )
-        if rows <= 0:
-            return JobChangeResult(False, previous_grow, previous_grow, 0, 0, note="character_missing")
         skills = build_job_change_skill_snapshot(
             job_i,
             first_grow=0,
             second_grow=0,
             level=lv,
-        )
-        repo.replace_character_skills(
-            cid,
-            skills,
-            page=0,
-            page_header=0,
-            clear_all_pages=True,
         )
         from game.chain_loader import load_chain
 
@@ -649,14 +632,11 @@ def apply_base_job_change(
         )
         remaining_sp = max(0, total_sp - int(spent_sp))
         remaining_tp = max(0, total_tp - int(spent_tp))
-        repo.upsert_character_skill_points(
-            cid,
-            total_sp=total_sp,
-            remaining_sp=remaining_sp,
-            total_tp=total_tp,
-            remaining_tp=remaining_tp,
-            synced_level=lv,
-        )
+        if not repo.replace_base_job_skill_state(
+            cid, job=job_i, skills=skills, total_sp=total_sp, remaining_sp=remaining_sp,
+            total_tp=total_tp, remaining_tp=remaining_tp, synced_level=lv,
+        ):
+            return JobChangeResult(False, previous_grow, previous_grow, 0, 0, note="character_missing")
         return JobChangeResult(
             True,
             previous_grow,
@@ -666,8 +646,7 @@ def apply_base_job_change(
             skills=tuple(skills),
             remaining_sp=remaining_sp,
             remaining_tp=remaining_tp,
-            note="job_db=%s skills=%s points=%s/%s"
-            % (rows, len(skills), remaining_sp, remaining_tp),
+            note="job_db=1 skills=%s points=%s/%s" % (len(skills), remaining_sp, remaining_tp),
         )
     except Exception as exc:
         return JobChangeResult(

@@ -1,4 +1,4 @@
-﻿using System.Net;
+using System.Net;
 using System.IO;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -311,6 +311,12 @@ public sealed class PythonLauncherApi : IDisposable
         var doc = await RequestAsync(HttpMethod.Post, "/launcher/v1/accounts/security-recovery", new { account = account.Trim(), security_question = question, security_answer = answer, new_password = newPassword });
         return (Text(doc, "account"), Text(doc, "recovery_code"));
     }
+
+    internal Task<JsonElement> AdventureOperationAsync(PythonSession session, object body) =>
+        RequestAsync(HttpMethod.Post, "/launcher/v1/adventure/operation", body, session.AccessToken);
+
+    internal Task<JsonElement> AdventureCollectionAsync(PythonSession session, object body) =>
+        RequestAsync(HttpMethod.Post, "/launcher/v1/adventure/collection", body, session.AccessToken);
 
     public Task<JsonElement> NoticesAsync() => RequestAsync(HttpMethod.Get, "/launcher/v1/notices");
     public Task<JsonElement> AssistAsync(PythonSession session, object body) =>

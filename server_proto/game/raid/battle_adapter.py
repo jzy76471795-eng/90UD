@@ -10,6 +10,9 @@ from math import ceil
 from secrets import randbelow, randbits
 from time import time
 
+from game.character.adventure_group import calculate_adventure_group_benefits_for_account
+from pvf.adventure_group_index import cn_adventure_traits_enabled
+
 from .battle_protocol import (
     C_RAID_ENTRY_COST_INFO, C_SELECT_RAID_REWARD_CARD, EntryCost, MemberReward,
     RewardItem as NativeRewardItem, N_RAID_ENTRY_COST_INFO, N_RAID_REWARD_LIST,
@@ -32,6 +35,10 @@ from .party_board import N_RAID_PARTIES, party_snapshot, encode_parties
 REWARD_AUTO_SELECT_SECONDS = 15
 REWARD_OFFLINE_FALLBACK_SECONDS = 30
 PERSONAL_CARD_DISPLAY_SECONDS = 4
+CN_RAID_MATERIAL_BONUSES = {
+    "anton": (10093971, "antonium_extra_one_percent"),
+    "luke": (10159142, "light_source_extra_one_percent"),
+}
 # Paired per-recipient display hint, outside the shipped PVF symbol range.
 # The low byte is zero on opening and the frozen member count on a team list.
 ANTON_TEAM_DRAWER_SYMBOL = 0x52445731
@@ -57,6 +64,7 @@ class ProjectionState:
     """Delivery cursor for one frozen selected session, never a whole raid."""
     symbol_cursor: tuple = (-1, -1, 0)
     native_state: tuple | None = None
+    active_state_packet: object = None
     native_dungeons: dict = field(default_factory=dict)
     native_tracked_dungeon: int | None = None
     native_participation: dict = field(default_factory=dict)
@@ -69,6 +77,21 @@ class ProjectionState:
     native_party_only_completion: int | None = None
     personal_delivery: tuple | None = None
     scene_generation: int | None = None
+    rebuild_participation: bool = False
+    hatchery_movie_cursor: tuple = (-1, -1, 0)
+    pending_visible_writes: dict = field(default_factory=dict)
+
+    def note_visible_write(self, packet):
+        receipt = self.pending_visible_writes.get(id(packet))
+        if receipt is None or receipt[0] is not packet:
+            return
+        kind, key, value = receipt[1]
+        if kind == 'hatchery_movie':
+            self.hatchery_movie_cursor = value
+        elif value is None:
+            self.native_participation.pop(key, None)
+        else:
+            self.native_participation[key] = value
 
 
 class RaidBattleAdapter:
@@ -175,6 +198,7 @@ class RaidBattleAdapter:
             if battle is None or pending[2][4][0] != battle.phase:
                 self._pending.pop(key)
                 pending[3]._raid_projection_sent = None
+                pending[1].active_state_packet = None
                 return None
         return pending
 
@@ -232,7 +256,7 @@ class RaidBattleAdapter:
             return ()
         return tuple(d.dungeon_id for d in battle.dungeons if d.state == 0)
 
-    def guard_dungeon_entry(self, session, dungeon_id, *, shared_ticket=None):
+    def guard_dungeon_entry(self, session, dungeon_id, *, shared_ticket=None, hatchery_source=None):
         with self._lock:
             entry, owner = self._entry(session)
             raid, now = entry.domain, self.clock()
@@ -241,14 +265,20 @@ class RaidBattleAdapter:
             battle = raid.battle
             if battle.status != 'active' or not battle.enter_after <= now < battle.deadline:
                 raise RaidError('normal raid phase is not open for entry')
-            if not self._prepared_for(entry, session):
+            if hatchery_source is not None:
+                target, _ = self.bridge.hatchery_portal(session, hatchery_source, pending_ticket=shared_ticket)
+                if target != dungeon_id:
+                    raise RaidError('hatchery entry differs from its owned Energy gate')
+            elif not self._prepared_for(entry, session):
                 raise RaidError('native raid party preparation has not been delivered')
             if shared_ticket is not None:
                 # Server-only opaque object identity, never a reconstructed C2S token.
                 actual = raid._ticket_owner(shared_ticket.run_id, owner.character_id, owner.account_id)
+                admitted = (self.bridge.pending_hatchery_participants(actual) if hatchery_source is not None
+                            else tuple(m.character_id for m in actual.participants))
                 if (actual is not shared_ticket or actual.dungeon_id != dungeon_id
                         or actual.attempt != raid.progression.epoch
-                        or tuple(m.character_id for m in actual.participants) != participants
+                        or admitted != participants
                         or actual.run_id in raid._accepted_runs or actual.run_id in raid._retired_runs):
                     raise RaidError('follower ticket differs from this pending owned group')
             elif not any(d.dungeon_id == dungeon_id and d.state == 0 for d in battle.dungeons):
@@ -356,14 +386,19 @@ class RaidBattleAdapter:
         native_participation = ({} if state in (5, 6) else {
             run: (dungeon, members) for run, dungeon, members
             in self.bridge.participation_snapshot(entry.domain, phase=battle.phase)})
-        # Remove before adding/rebuilding, and before 24C5 clears the native
-        # directory. Each recipient commits this cursor only after its send.
+        visible_writes = {}
+        # Quiet removal is idempotent when the scene has already cleared its
+        # directory. Clear prior entries before resending active parties.
         for run, previous in projection.native_participation.items():
-            if native_participation.get(run) != previous:
-                bodies.append((0, N_RAID_PARTICIPATION, participation_remove_body(*previous)))
+            if projection.rebuild_participation or native_participation.get(run) != previous:
+                body = (0, N_RAID_PARTICIPATION, participation_remove_body(*previous))
+                bodies.append(body)
+                visible_writes[id(body)] = ('participation', run, None)
         for run, current in native_participation.items():
-            if projection.native_participation.get(run) != current:
-                bodies.append((0, N_RAID_PARTICIPATION, participation_add_body(*current)))
+            if projection.rebuild_participation or projection.native_participation.get(run) != current:
+                body = (0, N_RAID_PARTICIPATION, participation_add_body(*current))
+                bodies.append(body)
+                visible_writes[id(body)] = ('participation', run, current)
         native_state = (state, battle.phase) if state is not None else projection.native_state
         party_only = self._party_only_display_complete(entry, battle, data, owner)
         finish_after_cards = state == 5 and native_state != projection.native_state
@@ -443,11 +478,22 @@ class RaidBattleAdapter:
             native_tracked_dungeon = 0
             if projection.native_dungeons or projection.native_state != native_state:
                 bodies.append((0, N_RAID_DUNGEON_STATE, dungeon_states_body((), tracked_dungeon_id=0)))
-        cursor = projection.symbol_cursor[2] if projection.symbol_cursor[:2] == (battle.phase, progress.epoch) else 0
+        epoch = (battle.phase, progress.epoch)
+        cursor = projection.symbol_cursor[2] if projection.symbol_cursor[:2] == epoch else 0
         writes = progress.writes_after(cursor)
-        for offset in range(0, len(writes), 255):
-            destination = before_drawer if battle.status == 'completed' else bodies
-            destination.append((0, N_RAID_SYMBOL, symbols_body((w.symbol_id, w.value) for w in writes[offset:offset + 255])))
+        movie_cursor = projection.hatchery_movie_cursor
+        delivered_movie = movie_cursor[2] if movie_cursor[:2] == epoch else 0
+        visible_symbols = tuple(w for w in writes if not (
+            w.name == 'MOVIE HATCHERY OPEN' and w.value and w.sequence <= delivered_movie))
+        destination = before_drawer if battle.status == 'completed' else bodies
+        for offset in range(0, len(visible_symbols), 255):
+            chunk = visible_symbols[offset:offset + 255]
+            body = (0, N_RAID_SYMBOL, symbols_body((w.symbol_id, w.value) for w in chunk))
+            destination.append(body)
+            movie = next((w for w in reversed(chunk) if w.name == 'MOVIE HATCHERY OPEN' and w.value), None)
+            if movie is not None:
+                movie_cursor = (*epoch, movie.sequence)
+                visible_writes[id(body)] = ('hatchery_movie', None, movie_cursor)
         bodies[:0] = before_drawer
         native_timers = ({} if state == 6 else
             {key: value for key, value in projection.native_timers.items() if key in progress.timers})
@@ -548,7 +594,7 @@ class RaidBattleAdapter:
         snapshot = (native_state, native_dungeons, native_timers, native_remaining,
                     (battle.phase, progress.epoch, writes[-1].sequence if writes else cursor),
                     native_tracked_dungeon, native_participation, native_phase_revives, native_parties, native_skills,
-                    frozenset(reward_keys), native_party_only_completion)
+                    frozenset(reward_keys), native_party_only_completion, movie_cursor, visible_writes)
         return bodies, snapshot
 
     def _project(self, entry, session):
@@ -572,7 +618,17 @@ class RaidBattleAdapter:
             delivered_result = (battle is not None and battle.status == 'completed'
                 and projection.native_state in ((4, battle.phase), (5, battle.phase)))
             previous = projection
-            projection = ProjectionState(scene_generation=generation)
+            projection = ProjectionState(
+                scene_generation=generation,
+                native_participation=previous.native_participation.copy(),
+                rebuild_participation=bool(previous.native_participation),
+                hatchery_movie_cursor=previous.hatchery_movie_cursor,
+            )
+            if (entry.family == 'anton' and battle is not None and battle.status == 'active'
+                    and previous.native_state in ((1, battle.phase), (2, battle.phase))):
+                # The scene needs its directory and symbols again. The phase
+                # notice belongs to the selected session and was already sent.
+                projection.native_state = previous.native_state
             if delivered_result:
                 # This cursor is bound to the selected-session epoch. Returning
                 # to town must not reopen an already delivered result drawer.
@@ -612,11 +668,25 @@ class RaidBattleAdapter:
                 delivery = data.phase_result_delivery = PhaseResultDelivery()
             batch = [delivery.packet(packet) for packet in batch]
         if batch:
-            self._pending[key] = (batch, projection, snapshot, session, owner)
+            self._queue_projection(key, session, owner, projection, bodies, batch, snapshot)
             if self.broadcast is not None and self.broadcast(entry, batch) is True:
                 self.projection_sent(entry, batch, session)
                 return []
         return batch
+
+    def _queue_projection(self, key, session, owner, projection, bodies, batch, snapshot):
+        state = snapshot[0]
+        visible_writes = snapshot[-1]
+        projection.pending_visible_writes = {
+            id(packet): (packet, visible_writes[id(body)])
+            for body, packet in zip(bodies, batch) if id(body) in visible_writes
+        }
+        projection.active_state_packet = None
+        if state is not None and state[0] in (1, 2):
+            projection.active_state_packet = next(
+                (packet for (flag, opcode, _), packet in zip(bodies, batch)
+                 if (flag, opcode) == (0, N_RAID_STATE)), None)
+        self._pending[key] = (batch, projection, snapshot, session, owner)
 
     def projection_sent(self, entry, batch, session=None):
         """Confirm only the exact batch, owner and selected-session generation."""
@@ -649,7 +719,11 @@ class RaidBattleAdapter:
              projection.native_remaining, projection.symbol_cursor,
              projection.native_tracked_dungeon, projection.native_participation,
              projection.native_phase_revives, projection.native_parties, projection.native_skills,
-             projection.native_rewards, projection.native_party_only_completion) = pending[2]
+             projection.native_rewards, projection.native_party_only_completion,
+             projection.hatchery_movie_cursor, _) = pending[2]
+            projection.rebuild_participation = False
+            projection.pending_visible_writes.clear()
+            projection.active_state_packet = None
             phase = pending[2][4][0]
             if projection.native_state == (4, phase):
                 data = self._runs[entry.domain.raid_key]
@@ -726,7 +800,7 @@ class RaidBattleAdapter:
                          lambda members, configuration: self._preflight(entry, members, configuration), commit,
                          program=progress, daily_account_counts=counts)
             self._runs[entry.domain.raid_key] = data
-            self._pending[key] = (packets, projection, snapshot, session, projection_owner)
+            self._queue_projection(key, session, projection_owner, projection, bodies, packets, snapshot)
             for member in data.admitted:
                 data.phase_deaths[(0, member.character_id)] = 0
             session.raid_instance_id, session.raid_phase = battle.instance_id, battle.phase
@@ -790,7 +864,7 @@ class RaidBattleAdapter:
         for pending_key in tuple(self._pending):
             if pending_key[0] == raid.raid_key:
                 self._pending_in_phase(entry, pending_key)
-        self._pending[key] = (packets, projection, snapshot, session, owner)
+        self._queue_projection(key, session, owner, projection, bodies, packets, snapshot)
         return packets
 
     def material_snapshot(self, entry, *, force=False):
@@ -911,11 +985,29 @@ class RaidBattleAdapter:
         cached=data.reward_plans.get(key)
         phase=self.runtime.rewards[entry.raid_type].phases[battle.phase]
         name={1:'party_card',2:'pcroom_card',3:'squad_item'}[kind]
+
+        def resolve_owned_reward(choice, roll):
+            items = tuple(self.runtime.reward_resolver(choice, roll))
+            material = CN_RAID_MATERIAL_BONUSES.get(entry.family)
+            if not cn_adventure_traits_enabled() or material is None:
+                return items
+            item_id, benefit = material
+            for index, item in enumerate(items):
+                if item.item_id == item_id:
+                    benefits = calculate_adventure_group_benefits_for_account(
+                        self.ledger.repo, int(member.account_id)
+                    )
+                    chance = getattr(benefits, benefit)
+                    if chance and roll(100) < chance:
+                        return (*items[:index], replace(item, quantity=item.quantity + 1), *items[index + 1:])
+                    break
+            return items
+
         def create_plan():
             if cached is not None:return cached[1]
             if key not in plans:
                 plans[key]=freeze_reward_plan(phase,name,data.phase_deaths[(battle.phase,member.character_id)],
-                    dict(battle.member_clears).get(member.character_id,0),True,self.roll,self.runtime.reward_resolver,
+                    dict(battle.member_clears).get(member.character_id,0),True,self.roll,resolve_owned_reward,
                     pc_room_eligible=kind!=2 or self.pc_room_eligible(member) is True)
             return plans[key]
         daily=getattr(self.ledger,'freeze_daily_phase_reward',None)

@@ -237,6 +237,7 @@ def generate_monster_drop_result(
     independent_drop_rate_bonus_percent: int = 0,
     include_hell_independent_drop: bool = True,
     include_hell_group_reward: bool = True,
+    epic_piece_bonus_count: int = 0,
 ) -> MonsterDropResult:
     """Roll and reserve scene slots without exposing the drops for pickup."""
     if raid_ground_drops_disabled(session):
@@ -276,6 +277,7 @@ def generate_monster_drop_result(
             ),
             include_independent_drop=bool(include_hell_independent_drop),
             include_group_reward=bool(include_hell_group_reward),
+            epic_piece_bonus_count=epic_piece_bonus_count,
         )
     else:
         req = MonsterDropRequest(

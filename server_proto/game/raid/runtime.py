@@ -15,6 +15,9 @@ from uuid import uuid4
 # Native management buttons select labels 1..10. Battle admission still
 # validates its separate family-specific configuration before any cost.
 PREPARATION_GROUP_MAX = 10
+ANTON_VOLCANO_DUNGEON = 219
+ANTON_HEART_DUNGEON = 220
+ANTON_FULL_BARRIER = 10000
 
 
 class RaidError(ValueError):
@@ -23,6 +26,10 @@ class RaidError(ValueError):
 
 class RaidEventExpired(RaidError):
     """A previously owned event outlived its phase, attempt or map."""
+
+
+class RaidMapClosed(RaidError):
+    pass
 
 
 class EntryMaterialsMissing(RaidError):
@@ -320,6 +327,7 @@ class Raid:
         self._squad_leavers = {}
         self._cleared = set()
         self._closed_map_runs = set()
+        self._volcano_boss_deaths = set()
         self._recipients = {}
         self._entitlements = {}
         self._committed_rewards = set()
@@ -567,7 +575,8 @@ class Raid:
                 if authority.issuer is issuer and authority.generation == generation:
                     self._ordinary_grants.pop(authority, None)
 
-    def bind_run(self, actor, dungeon_id, participants, now, *, ordinary_authority=None):
+    def bind_run(self, actor, dungeon_id, participants, now, *, ordinary_authority=None,
+                 hatchery_source=None):
         with self._lock:
             self.advance_clock(now)
             b = self._active(now)
@@ -579,7 +588,17 @@ class Raid:
             members = tuple(self.member(cid) for cid in ids)
             if any(m != self._admitted.get(m.character_id) for m in members):
                 raise RaidError("prepared account differs from admitted owners")
-            if ordinary_authority is None:
+            if hatchery_source is not None:
+                source = self._ticket_owner(hatchery_source.run_id, actor, owner.account_id)
+                if (ordinary_authority is not None or self.family != 'anton' or b.phase != 1
+                        or dungeon_id not in range(221, 225) or source is not hatchery_source
+                        or source.dungeon_id != 218 or source.attempt != self._program.epoch
+                        or source.run_id not in self._accepted_runs or source.run_id in self._retired_runs
+                        or source.run_id in self._cleared
+                        or not all(member in source.participants for member in members)
+                        or set(ids).intersection(self._run_departures.get(source.run_id, ()))):
+                    raise RaidError('hatchery entry requires the same surviving Energy participants')
+            elif ordinary_authority is None:
                 if any(m.group != owner.group for m in members):
                     raise RaidError("prepared group/account differs from admitted owners")
             else:
@@ -594,6 +613,8 @@ class Raid:
                         or not authority.publication.current()):
                     raise RaidError('foreign, stale or replayed ordinary run authority')
             if not any(s.dungeon_id == dungeon_id and s.state == 0 for s in b.dungeons):
+                if hatchery_source is not None:
+                    raise RaidMapClosed("dungeon is not open")
                 raise RaidError("dungeon is not open")
             attempt = self._program.epoch if self._program is not None else 1
             ticket = RunTicket(uuid4().hex, b.instance_id, b.phase, attempt, dungeon_id, members)
@@ -604,6 +625,31 @@ class Raid:
                 self._battle = replace(b, dungeons=next_program.states)
             self._tickets[ticket.run_id] = ticket
             return ticket
+
+    def cancel_unused_hatchery_entry(self, ticket):
+        with self._lock:
+            run_id = ticket.run_id
+            if (self._tickets.get(run_id) is ticket
+                    and self.family == 'anton' and ticket.phase == 1 and ticket.dungeon_id in range(221, 225)
+                    and run_id not in self._accepted_runs):
+                self._tickets.pop(run_id)
+                self._run_departures.pop(run_id, None)
+                self._squad_leavers.pop(run_id, None)
+                self._closed_map_runs.discard(run_id)
+
+    def withdraw_pending_hatchery_members(self, ticket, members):
+        """Exclude disconnected players from this pending entry and its clear credit."""
+        with self._lock:
+            run_id = ticket.run_id
+            if (self._tickets.get(run_id) is not ticket or self.family != 'anton'
+                    or ticket.phase != 1 or ticket.dungeon_id not in range(221, 225)
+                    or run_id in self._accepted_runs or run_id in self._retired_runs):
+                raise RaidError('withdrawal requires a pending Anton hatchery ticket')
+            ids = {member.character_id for member in ticket.participants}
+            if not members < ids:
+                raise RaidError('hatchery withdrawal must preserve actual surviving participants')
+            self._run_departures.setdefault(run_id, set()).update(members)
+            self._squad_leavers.setdefault(run_id, set()).update(members)
 
     def _ticket_owner(self, run_id, actor, account_id):
         ticket = self._tickets.get(run_id)
@@ -659,6 +705,7 @@ class Raid:
                 self._program = program
                 self._battle = replace(self._battle, dungeons=program.states)
             self._retired_runs.add(run_id)
+            self._volcano_boss_deaths.discard(run_id)
             return True
 
     def enter_map(self, run_id, actor, account_id, map_id, now):
@@ -691,6 +738,36 @@ class Raid:
             self._battle = replace(b, dungeons=program.states)
             return self._battle
 
+    def uses_volcano_barrier(self, ticket):
+        return self.family == 'anton' and ticket.phase == 1 and ticket.dungeon_id == ANTON_VOLCANO_DUNGEON
+
+    def is_anton_heart(self, ticket):
+        return self.family == 'anton' and ticket.phase == 1 and ticket.dungeon_id == ANTON_HEART_DUNGEON
+
+    def accept_volcano_boss_death(self, run_id, actor, account_id, now):
+        """Approve the actual terminal actor while the shared shield is below full."""
+        with self._lock:
+            ticket = self._ticket_owner(run_id, actor, account_id)
+            if (not self.uses_volcano_barrier(ticket) or run_id not in self._accepted_runs
+                    or run_id in self._retired_runs or actor in self._squad_leavers.get(run_id, ())):
+                raise RaidError('accepted owned phase-two Volcano run required')
+            # A shared death is projected on each member's account thread.
+            # A later projection keeps the result sampled by the first death.
+            if run_id in self._volcano_boss_deaths:
+                return True
+            self.advance_clock(now)
+            self._active(now)
+            if ticket.attempt != self._program.epoch or run_id in self._cleared:
+                raise RaidEventExpired('Volcano boss death belongs to an expired run')
+            if self._program.symbols['BLACK VOLCANO BARRIER'] >= ANTON_FULL_BARRIER:
+                return False
+            self._volcano_boss_deaths.add(run_id)
+            return True
+
+    def has_volcano_boss_death(self, run_id):
+        with self._lock:
+            return run_id in self._volcano_boss_deaths
+
     def credit_luke_generator(self, run_id, actor, account_id, event_id, now):
         """A bridge-bound native machine report cannot supply a symbol/value."""
         with self._lock:
@@ -713,11 +790,14 @@ class Raid:
         recipients = {cid: self._members[cid] for cid, m in self._admitted.items()
                       if cid in self._members and counts.get(cid, 0) >= threshold}
         if not recipients:
+            if self.family == 'anton' and b.phase == 1:
+                self._battle = replace(b, reward_finished_at=b.completed_at)
+                return
             raise RaidError("completed phase has no qualified frozen recipients")
         for cid, member in recipients.items():
             self._recipients[(b.phase, cid)] = member
 
-    def clear(self, proof, now):
+    def clear(self, proof, now, *, finish_heart=False):
         with self._lock:
             _time(now)
             b = self._battle
@@ -736,9 +816,19 @@ class Raid:
             # Valid replays from followers are no-ops even once phase completes.
             if ticket.run_id in self._cleared:
                 return False
+            if self.uses_volcano_barrier(ticket) and ticket.run_id not in self._volcano_boss_deaths:
+                raise RaidError("phase-two Volcano settlement requires an approved boss death")
             self.advance_clock(now)
             b = self._battle
-            if b.status != 'active' or self._program is not None and ticket.attempt != self._program.epoch:
+            if self._program is not None and ticket.attempt != self._program.epoch:
+                raise RaidEventExpired("clear belongs to an expired attempt")
+            if (finish_heart and b.status == 'completed' and self.is_anton_heart(ticket)
+                    and ticket.run_id in self._accepted_runs):
+                # Another squad counted the fifth clear. Finish this already
+                # verified encounter without another team or personal credit.
+                self._cleared.add(ticket.run_id)
+                return False
+            if b.status != 'active':
                 raise RaidEventExpired("clear belongs to a finished phase or expired attempt")
             self._active(now)
             map_open = any(s.dungeon_id == ticket.dungeon_id and s.state == 0 for s in b.dungeons)
@@ -775,9 +865,10 @@ class Raid:
                                 (other.phase, other.attempt, other.dungeon_id) == (ticket.phase, ticket.attempt, ticket.dungeon_id)):
                             self._closed_map_runs.add(other_id)
             counts = dict(b.member_clears)
-            for member in ticket.participants:
-                if member.character_id not in self._squad_leavers.get(ticket.run_id, ()):
-                    counts[member.character_id] = counts.get(member.character_id, 0) + 1
+            if not self.is_anton_heart(ticket):
+                for member in ticket.participants:
+                    if member.character_id not in self._squad_leavers.get(ticket.run_id, ()):
+                        counts[member.character_id] = counts.get(member.character_id, 0) + 1
             self._cleared.add(ticket.run_id)
             self._battle = replace(b, dungeons=states, member_clears=tuple(sorted(counts.items())),
                                    single_index=next_index, status="completed" if completed else "active",
@@ -824,6 +915,9 @@ class Raid:
             if self._weekly_committed:
                 return True
             members = tuple(m for (phase, cid), m in sorted(self._recipients.items()) if phase == b.phase)
+            if not members and self.family == 'anton' and b.phase == 1:
+                self._weekly_committed = True
+                return False
             if not members or not callable(commit):
                 raise RaidError("qualified weekly transaction adapter required")
             intent = WeeklyIntent(b.instance_id, self.family, members, self._configuration.weekly_limit, b.completed_at)

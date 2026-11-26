@@ -9,13 +9,14 @@ from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Iterable
 
+from game.character.fatigue_flow import RESET_UTC_OFFSET_SECONDS
 from game.character.item_metadata import job_label_for_id
 from pvf import pvf_runtime
 
 
 STACKABLE_LIST_PATH = "stackable/stackable.lst"
 EXP_BONUS_CACHE_DOMAIN = "exp_bonus_consumables"
-EXP_BONUS_CACHE_VERSION = 2
+EXP_BONUS_CACHE_VERSION = 3
 EXP_BONUS_RATE_SCALE = 1_000_000
 MAX_EXP_BONUS_RATE_PPM = 100 * EXP_BONUS_RATE_SCALE
 MAX_EXP_BONUS_DURATION_MS = 365 * 24 * 60 * 60 * 1000
@@ -109,6 +110,7 @@ class ExpBonusConsumableRule:
     maximum_level: int | None = None
     usable_jobs: tuple[str, ...] = ()
     impossible_contents: tuple[str, ...] = ()
+    quest_bonus: bool = False
 
     def __post_init__(self) -> None:
         item_id = int(self.item_id)
@@ -217,11 +219,12 @@ class ExpBonusConsumableRule:
             list(self.usable_jobs),
             list(self.impossible_contents),
             str(self.source_path),
+            self.quest_bonus,
         ]
 
     @classmethod
     def from_cache_row(cls, row: Any) -> "ExpBonusConsumableRule":
-        if not isinstance(row, list) or len(row) != 9:
+        if not isinstance(row, list) or len(row) != 10 or type(row[9]) is not bool:
             raise ValueError("invalid cached EXP consumable row")
         if not isinstance(row[6], list) or not isinstance(row[7], list):
             raise ValueError("invalid cached EXP consumable eligibility fields")
@@ -235,6 +238,7 @@ class ExpBonusConsumableRule:
             usable_jobs=tuple(str(value) for value in row[6]),
             impossible_contents=tuple(str(value) for value in row[7]),
             source_path=str(row[8]),
+            quest_bonus=row[9],
         )
 
 
@@ -244,7 +248,8 @@ def parse_exp_bonus_consumable_rule(
     *,
     source_path: str,
 ) -> ExpBonusConsumableRule | None:
-    rate_body = _section(text, "exp bonus rate")
+    quest_bonus = int(item_id) == 10304122 and "[quest_growth_drug]" in _section(text, "action type").casefold()
+    rate_body = _section(text, "quest exp bonus rate" if quest_bonus else "exp bonus rate")
     if not rate_body:
         return None
 
@@ -289,6 +294,7 @@ def parse_exp_bonus_consumable_rule(
         usable_jobs=_section_tokens(text, "usable job"),
         impossible_contents=_section_tokens(text, "impossible contents"),
         source_path=source_path,
+        quest_bonus=quest_bonus,
     )
 
 
@@ -467,10 +473,11 @@ class ActiveExpBonusEffect:
         )
 
 
-def _ensure_effect_schema(conn: Any) -> None:
+def _ensure_effect_schema(conn: Any, *, quest_bonus: bool = False) -> str:
+    table = "character_quest_exp_bonus_effects" if quest_bonus else "character_exp_bonus_effects"
     conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS character_exp_bonus_effects (
+        f"""
+        CREATE TABLE IF NOT EXISTS {table} (
             character_id INTEGER PRIMARY KEY,
             source_item_id INTEGER NOT NULL CHECK (
                 source_item_id > 0 AND source_item_id <= 4294967295
@@ -488,9 +495,10 @@ def _ensure_effect_schema(conn: Any) -> None:
         """
     )
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_character_exp_bonus_effects_expiry "
-        "ON character_exp_bonus_effects(expires_at)"
+        f"CREATE INDEX IF NOT EXISTS idx_{table}_expiry "
+        f"ON {table}(expires_at)"
     )
+    return table
 
 
 def activate_exp_bonus_consumable_at(
@@ -537,7 +545,7 @@ def activate_exp_bonus_consumable_at(
 
     with repo.open() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        _ensure_effect_schema(conn)
+        table = _ensure_effect_schema(conn, quest_bonus=rule.quest_bonus)
         character = conn.execute(
             "SELECT level, job FROM characters "
             "WHERE character_id = ? AND delete_flag = 0",
@@ -563,7 +571,7 @@ def activate_exp_bonus_consumable_at(
 
         active_row = conn.execute(
             "SELECT source_item_id, bonus_rate_ppm, activated_at, expires_at "
-            "FROM character_exp_bonus_effects WHERE character_id = ?",
+            f"FROM {table} WHERE character_id = ?",
             (cid,),
         ).fetchone()
         if active_row is not None and int(active_row[3] or 0) > now:
@@ -578,7 +586,7 @@ def activate_exp_bonus_consumable_at(
             return False, "exp_bonus_already_active", detail
 
         row = conn.execute(
-            "SELECT item_uid, item_template_id, item_kind, stack_count "
+            "SELECT item_uid, item_template_id, item_kind, stack_count, expire_time "
             "FROM character_items "
             "WHERE character_id = ? AND list_type = ? AND slot_index = ? LIMIT 1",
             (cid, list_value, slot),
@@ -600,10 +608,34 @@ def activate_exp_bonus_consumable_at(
         )
         if item_id <= 0 or original_count <= 0:
             return False, "invalid_item", detail
+        if int(row[4] or 0) and int(row[4]) <= now:
+            return False, "expired_item", detail
         if item_id != expected:
             return False, "item_mismatch", detail
         if item_kind == "equipment":
             return False, "equipment", detail
+
+        if rule.quest_bonus:
+            # The CN elixir tooltip specifies one use per character every day at 06:00.
+            # The active effect can expire or be removed independently of this count.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS character_quest_exp_elixir_usage ("
+                "character_id INTEGER PRIMARY KEY REFERENCES characters(character_id) ON DELETE CASCADE, "
+                "day_number INTEGER NOT NULL)"
+            )
+            day_number = (now + RESET_UTC_OFFSET_SECONDS) // 86400
+            previous = conn.execute(
+                "SELECT day_number FROM character_quest_exp_elixir_usage WHERE character_id=?",
+                (cid,),
+            ).fetchone()
+            if ((previous is not None and previous[0] >= day_number)
+                    or (active_row is not None and (int(active_row[2]) + RESET_UTC_OFFSET_SECONDS) // 86400 == day_number)):
+                return False, "quest_exp_elixir_daily_limit", detail
+            conn.execute(
+                "INSERT INTO character_quest_exp_elixir_usage(character_id,day_number) VALUES (?,?) "
+                "ON CONFLICT(character_id) DO UPDATE SET day_number=excluded.day_number",
+                (cid, day_number),
+            )
 
         remaining = original_count - 1
         if remaining <= 0:
@@ -617,7 +649,7 @@ def activate_exp_bonus_consumable_at(
 
         expires_at = min(0x7FFFFFFFFFFFFFFF, now + int(rule.duration_seconds))
         conn.execute(
-            "INSERT INTO character_exp_bonus_effects "
+            f"INSERT INTO {table} "
             "(character_id, source_item_id, bonus_rate_ppm, activated_at, "
             "expires_at, source_path) VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(character_id) DO UPDATE SET "
@@ -654,16 +686,17 @@ def get_active_exp_bonus_effect(
     character_id: int,
     *,
     now_unix: int | None = None,
+    quest_bonus: bool = False,
 ) -> ActiveExpBonusEffect | None:
     cid = int(character_id)
     if cid <= 0:
         return None
     now = int(time.time()) if now_unix is None else max(0, int(now_unix))
     with repo.open() as conn:
-        _ensure_effect_schema(conn)
+        table = _ensure_effect_schema(conn, quest_bonus=quest_bonus)
         row = conn.execute(
             "SELECT source_item_id, bonus_rate_ppm, activated_at, expires_at, source_path "
-            "FROM character_exp_bonus_effects WHERE character_id = ?",
+            f"FROM {table} WHERE character_id = ?",
             (cid,),
         ).fetchone()
         if row is None:
@@ -672,7 +705,7 @@ def get_active_exp_bonus_effect(
         rate = int(row[1] or 0)
         if expires_at <= now or rate <= 0 or rate > MAX_EXP_BONUS_RATE_PPM:
             conn.execute(
-                "DELETE FROM character_exp_bonus_effects WHERE character_id = ?",
+                f"DELETE FROM {table} WHERE character_id = ?",
                 (cid,),
             )
             return None
@@ -693,22 +726,19 @@ def build_exp_bonus_item_state_restore_packets(
     *,
     now_unix: int | None = None,
 ) -> tuple[list[bytes], str]:
-    """Restore one persisted EXP item's cooldown and effect with one time snapshot."""
+    """Restore the persisted EXP cooldowns and effects with one time snapshot."""
     now = int(time.time()) if now_unix is None else max(0, int(now_unix))
-    effect = get_active_exp_bonus_effect(
-        repo,
-        int(character_id),
-        now_unix=now,
-    )
-    if effect is None:
+    active = []
+    for quest_bonus in (False, True):
+        effect = get_active_exp_bonus_effect(repo, int(character_id), now_unix=now, quest_bonus=quest_bonus)
+        if effect is not None:
+            remaining = min(0xFFFFFFFF, int(effect.expires_at) - now)
+            if remaining > 0 and 0 < int(effect.source_item_id) <= 0xFFFFFFFF:
+                active.append((effect.source_item_id, remaining))
+    if not active:
         return [], "EXP item state restore inactive"
 
-    remaining = min(0xFFFFFFFF, max(0, int(effect.expires_at) - now))
-    item_id = int(effect.source_item_id)
-    if remaining <= 0 or item_id <= 0 or item_id > 0xFFFFFFFF:
-        return [], "EXP item state restore invalid active row"
-
-    body = struct.pack("<BII", 1, item_id, remaining)
+    body = bytes((len(active),)) + b"".join(struct.pack("<II", item, seconds) for item, seconds in active)
     packets = [
         server._codec_response(
             0,
@@ -721,19 +751,15 @@ def build_exp_bonus_item_state_restore_packets(
             body,
         ),
     ]
-    return packets, (
-        "S0/00AC->S0/00AE EXP item state restore "
-        "item=%d remaining_seconds=%d" % (item_id, remaining)
-    )
+    notes = " ".join("item=%d remaining_seconds=%d" % (item, seconds) for item, seconds in active)
+    return packets, "S0/00AC->S0/00AE EXP item state restore " + notes
 
 
 def clear_exp_bonus_effect(repo: Any, character_id: int) -> None:
     with repo.open() as conn:
-        _ensure_effect_schema(conn)
-        conn.execute(
-            "DELETE FROM character_exp_bonus_effects WHERE character_id = ?",
-            (int(character_id),),
-        )
+        for quest_bonus in (False, True):
+            table = _ensure_effect_schema(conn, quest_bonus=quest_bonus)
+            conn.execute(f"DELETE FROM {table} WHERE character_id = ?", (int(character_id),))
 
 
 __all__ = [

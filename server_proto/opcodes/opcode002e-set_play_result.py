@@ -36,6 +36,7 @@ from typing import Any, Optional, Tuple
 
 from game.chain_loader import load_chain
 from game.quest.quest_clear import DungeonClearContext, apply_dungeon_clear_to_active_quests
+from game.quest.adventure_season1 import record_clear as record_adventure_season1_clear
 from game.quest.weekly_attendance import record_clear as record_weekly_attendance_clear
 from game.quest.quest_session import (
     bind_session_quest_state,
@@ -126,6 +127,30 @@ def _extract_client_rank_point(body: bytes) -> int:
     if len(raw) > 10:
         return int(raw[10]) & 0xFF
     return int(raw[0]) & 0xFF
+
+
+def _cleared_hell_party(session: Any) -> bool:
+    if int(getattr(session, "dungeon_clear_phase", 0) or 0) != 1:
+        return False
+    if getattr(session, "dungeon_hell_enabled", False):
+        room = _room_state.get_room_state(
+            session,
+            maze_index=session.dungeon_maze_index,
+            cell_x=session.dungeon_hell_x,
+            cell_y=session.dungeon_hell_y,
+            map_index=session.dungeon_hell_map_index,
+        )
+        if room is None:
+            return False
+        actors = [actor for actor in room["monsters"] if actor.get("is_hell_party_actor")]
+        return bool(actors) and all(actor.get("killed") for actor in actors)
+    if not getattr(session, "dungeon_special_hell", False):
+        return False
+    # Standalone special-Hell stages have no generated Hell Party room.
+    if session.dungeon_cell_x != session.dungeon_boss_x or session.dungeon_cell_y != session.dungeon_boss_y:
+        return False
+    blockers = [actor for actor in session.dungeon_room_mons if actor.get("is_blocking", True)]
+    return bool(blockers) and all(actor.get("killed") for actor in blockers)
 
 
 def advance_special_dungeon_selector_progress(
@@ -1265,6 +1290,7 @@ class SetPlayResult002EService:
                         % (user_key, cid)
                     )
 
+        grief_tower_cleared = False
         if cid > 0:
             grief_floor = floor_for_dungeon("grief", dungeon_id)
             if grief_floor is not None:
@@ -1278,6 +1304,7 @@ class SetPlayResult002EService:
                         "grief",
                         grief_floor,
                     )
+                    grief_tower_cleared = grief_floor == grief_progress == 100
                     body_050e = build_grief_progress_050e(grief_progress)
                     packet_050e, mode_050e = self._emit(
                         0,
@@ -1304,6 +1331,7 @@ class SetPlayResult002EService:
                         )
                     )
 
+        despair_floor_cleared = False
         if cid > 0:
             despair_floor = floor_for_dungeon("despair", dungeon_id)
             if despair_floor is not None:
@@ -1317,6 +1345,7 @@ class SetPlayResult002EService:
                         "despair",
                         despair_floor,
                     )
+                    despair_floor_cleared = despair_progress >= despair_floor
                     notes.append(
                         "despair_progress floor=%d cleared_floor=%d no_0328"
                         % (despair_floor, despair_progress)
@@ -1371,6 +1400,15 @@ class SetPlayResult002EService:
                     notes.append("weekly_attendance_clear=1")
             except (OSError, ValueError, sqlite3.Error) as exc:
                 notes.append("weekly_attendance_clear_error=%s:%s" % (type(exc).__name__, exc))
+            try:
+                if record_adventure_season1_clear(
+                    self.server, session, despair_floor_cleared=despair_floor_cleared,
+                    grief_tower_cleared=grief_tower_cleared,
+                    hell_party_cleared=_cleared_hell_party(session),
+                ):
+                    notes.append("adventure_season1_clear=1")
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                notes.append(f"adventure_season1_clear_error={type(exc).__name__}:{exc}")
             session.dungeon_clear_phase = 2
             try:
                 session.dungeon_clear_exp_base = clear_base

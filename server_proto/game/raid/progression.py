@@ -374,6 +374,7 @@ class Progression:
         self._barrier_events = {}
         self._luke_events = {}
         self._writes, self._sequence, self._random, self._last, self._barrier_next = (), 0, seed & 0xffffffffffffffff, now, 0
+        self._volcano_open = None
         self._luke_card_record = self._next_random(len(program.luke.maze_records)) if program.luke is not None and phase == 0 else None
         self._evaluate(now, [("initial", 0, "")])
         if self.family == "anton" and phase == 1:
@@ -436,8 +437,11 @@ class Progression:
     def _write(self, name, value):
         if name not in self._program.symbols:
             raise ProgressionError("native symbol owner unavailable")
+        self._append_symbol_write(name, self._program.symbols[name], value)
+
+    def _append_symbol_write(self, name, symbol_id, value):
         self._sequence += 1
-        self._writes = (self._writes + (SymbolWrite(self._sequence, name, self._program.symbols[name], value),))[-4096:]
+        self._writes = (self._writes + (SymbolWrite(self._sequence, name, symbol_id, value),))[-4096:]
 
     def _assign(self, name, value):
         if self._symbols.get(name, 0) != value:
@@ -446,6 +450,14 @@ class Progression:
 
     def _symbol(self, name, value, events):
         self._write(name, value)
+        if (self.family == "anton" and self.phase == 1
+                and name == "BLACK VOLCANO BARRIER" and value in (0, 10000)):
+            volcano_open = value == 0
+            # The client reads symbol 111 separately from energy. During
+            # partial recharge it retains the last open/closed state.
+            if self._volcano_open != volcano_open:
+                self._volcano_open = volcano_open
+                self._append_symbol_write("BLACK VOLCANO OPEN", 111, int(volcano_open))
         if self._symbols.get(name, 0) == value:
             return
         self._symbols[name] = value

@@ -148,7 +148,7 @@ class NormalPartyRuns:
             self._queue(m, 'cancel', run)
         run.deaths.clear()
 
-    def detach(self, session, *, continue_move=False):
+    def detach(self, session, *, continue_move=True, continue_entry=False):
         """Metadata only; called on confirmed return/actual membership removal."""
         with self._metadata():
             run = self._current(session)
@@ -161,7 +161,8 @@ class NormalPartyRuns:
             # cancel survivors merely because their loading is still pending.
             cycle = run.cycle
             keep_move = continue_move and cycle.kind == 'move' and run.active
-            if not cycle.committed and not keep_move:
+            keep_preparing = keep_move or (continue_entry and cycle.kind == 'entry' and run.active)
+            if not cycle.committed and not keep_preparing:
                 self._cancel(run, 'member left during shared scene preparation')
             c = m.selection[0]
             run.departed.add(c)
@@ -183,7 +184,7 @@ class NormalPartyRuns:
             if not self._members(run):
                 run.active = False
             elif run.active:
-                if keep_move and not cycle.committed:
+                if keep_preparing and not cycle.committed:
                     survivors = self._members(run)
                     if cycle.first is m:
                         cycle.first = next((peer for peer in survivors
@@ -636,7 +637,7 @@ class NormalPartyRuns:
             if run is None:return None
             return run.world.room_plan(session,self._member(run,session).identity,key)
 
-    def note_death(self,session,row):
+    def note_death(self,session,row,*,count_for_adventure=False):
         with self._metadata():
             run = self._current(session)
             if run is None or not run.active:return
@@ -646,11 +647,13 @@ class NormalPartyRuns:
             identity = run.world.actor_identity(session, m.identity, row, missing_ok=True)
             if identity is None:
                 return
+            adventure_key = identity.capability if count_for_adventure else None
             for peer,owner,actual in run.world.owned_actor_views(identity):
                 target = next((p for p in self._members(run) if p.session is peer and p.identity == owner),None)
                 if target is None or target is m or not self._scene(run,target):continue
                 events = run.deaths.setdefault(target.selection[0],{})
-                events.setdefault(identity,(target,run.cycle,actual))
+                events.setdefault(identity,(target,run.cycle,actual,adventure_key))
+            return adventure_key
 
     def _drain_deaths(self,session,client):
         with self._metadata():
@@ -660,7 +663,7 @@ class NormalPartyRuns:
             if not self._scene(run,m) or m.selection[0] not in run.cycle.loaded:return
             events = run.deaths.get(m.selection[0], {})
             pending = tuple(events.items())
-        for identity, (_, cycle, row) in pending:
+        for identity, (_, cycle, row, adventure_key) in pending:
             try:
                 with self._metadata():
                     if (not self._scene(run, m) or run.cycle is not cycle or row.get('killed')
@@ -668,7 +671,7 @@ class NormalPartyRuns:
                             or run.world.actor_identity(session, m.identity, row) is not identity):
                         continue
                 # The recipient's native handler owns its XP, quests and drops.
-                self._scope.death = (session, run, m, row, identity)
+                self._scope.death = (session, run, m, row, identity, adventure_key)
                 packets, _ = self.server._handle_die_monster_0027(b'', session=session)
                 for packet in packets:
                     client.sendall(packet)
@@ -678,15 +681,19 @@ class NormalPartyRuns:
                 with self._metadata():
                     events.pop(identity, None)
 
-    def death_row(self,session):
+    def death_event(self,session):
         value = getattr(self._scope,'death',None)
         if value is None or value[0] is not session:return None
-        _,run,m,row,identity = value
+        _,run,m,row,identity,adventure_key = value
         with self._metadata():
             if (not run.active or not self._scene(run,m) or
                     run.world.actor_identity(session,m.identity,row) is not identity):
                 raise RaidError('shared death callback lost its actual row binding')
-        return row
+        return row, adventure_key
+
+    def death_row(self,session):
+        event = self.death_event(session)
+        return event[0] if event is not None else None
 
 
 def _service(server):
@@ -716,10 +723,17 @@ def room_plan_for(server,session,key):
     s=_service(server)
     return s.room_plan(session,key) if s else None
 
-def note_actor_death(server,session,row):
+def note_actor_death(server,session,row,*,count_for_adventure=False):
     s=_service(server)
-    if s:s.note_death(session,row)
+    return s.note_death(session,row,count_for_adventure=count_for_adventure) if s else None
+
+def owned_death_event(server,session):
+    s=_service(server)
+    event = s.death_event(session) if s else None
+    if event is not None:
+        return event
+    hooks = getattr(server, 'raid_transport_hooks', None)
+    return (hooks.owned_death_row(session) if hooks is not None else None), None
 
 def owned_death_row(server,session):
-    s=_service(server)
-    return s.death_row(session) if s else None
+    return owned_death_event(server,session)[0]

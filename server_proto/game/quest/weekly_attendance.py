@@ -9,14 +9,28 @@ import os
 from time import time
 from uuid import uuid4
 
+from game.character.item_metadata import resolve_item_metadata
 from game.native_mailbox import identity
 
 
 START_ENV = "USDOF_GAME_WEEKLY_ATTENDANCE_START"
+EVENT_ID = 1083
 WEEK_SECONDS = int(timedelta(weeks=1).total_seconds())
 WEEKLY_ITEMS = (490009970, 490009971, 490009972, 490009973, 490009974,
                 490009975, 490009976, 490009977, 490009978, 490009979)
 MILESTONE_ITEMS = {3: 490009980, 6: 490009981, 9: 490009982}
+ARMOR_VOUCHER = 490009989
+DATED_CONTENT_ITEMS = frozenset((490009983, 490009984, 490009985, 490009987,
+                                 490009988, ARMOR_VOUCHER, 490009990, 490009991,
+                                 490009993, 490009994, 490009995, 490009996,
+                                 490009997, 490010029))
+RAID_DAILY_REWARDS = {
+    490009996: 10162064,
+    490009997: 10162065,
+    10162064: 10096296,
+    10162065: 10159649,
+}
+LEVEL_GATED_BOXES = frozenset((*WEEKLY_ITEMS, 490009996, 490009997))
 WEEKLY_CLEARS = 4
 MAKEUP_CLEARS = 20
 MAKEUP_LIMIT = 2
@@ -68,9 +82,38 @@ def current_week(start: int | None, now: float) -> int:
 def begin_run(session, path: str, *, recommended: bool, raid: bool) -> None:
     directory, _, filename = path.replace("\\", "/").lower().removeprefix("dungeon/").partition("/")
     eligible = bool(filename and recommended and not raid and directory not in EXCLUDED_DUNGEON_DIRS)
-    session.weekly_attendance_run_id = (
-        uuid4().hex if eligible and current_week(activity_start(), time()) else None
+    start = activity_start() if eligible else None
+    dungeon_id = int(getattr(session, "selected_dungeon_id", 0) or 0)
+    session.weekly_attendance_run = (
+        (uuid4().hex, dungeon_id, start)
+        if dungeon_id > 0 and start is not None and current_week(start, time()) else None
     )
+
+
+_REWARD_SCHEMA = """CREATE TABLE IF NOT EXISTS weekly_attendance_rewards (
+    activity_start INTEGER NOT NULL,
+    account_id INTEGER NOT NULL REFERENCES accounts(account_id),
+    kind TEXT NOT NULL CHECK(kind IN ('week', 'cumulative')),
+    slot INTEGER NOT NULL,
+    is_makeup INTEGER NOT NULL CHECK(is_makeup IN (0, 1)),
+    character_id INTEGER NOT NULL,
+    granted_at INTEGER NOT NULL,
+    PRIMARY KEY(activity_start, account_id, kind, slot))"""
+
+
+def migrate_reward_ledger(conn) -> None:
+    # The receiving character is historical. Account-wide claims survive character deletion.
+    if not any(row[2] == "characters" for row in conn.execute("PRAGMA foreign_key_list(weekly_attendance_rewards)")):
+        return
+    conn.execute("ALTER TABLE weekly_attendance_rewards RENAME TO weekly_attendance_rewards_legacy")
+    conn.execute(_REWARD_SCHEMA)
+    conn.execute(
+        """INSERT INTO weekly_attendance_rewards
+           (activity_start, account_id, kind, slot, is_makeup, character_id, granted_at)
+           SELECT activity_start, account_id, kind, slot, is_makeup, character_id, granted_at
+           FROM weekly_attendance_rewards_legacy"""
+    )
+    conn.execute("DROP TABLE weekly_attendance_rewards_legacy")
 
 
 def _ensure_schema(conn) -> None:
@@ -82,25 +125,18 @@ def _ensure_schema(conn) -> None:
            week INTEGER NOT NULL CHECK(week BETWEEN 1 AND 10),
            PRIMARY KEY(activity_start, account_id, run_id))"""
     )
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS weekly_attendance_rewards (
-           activity_start INTEGER NOT NULL,
-           account_id INTEGER NOT NULL REFERENCES accounts(account_id),
-           kind TEXT NOT NULL CHECK(kind IN ('week', 'cumulative')),
-           slot INTEGER NOT NULL,
-           is_makeup INTEGER NOT NULL CHECK(is_makeup IN (0, 1)),
-           character_id INTEGER NOT NULL REFERENCES characters(character_id),
-           granted_at INTEGER NOT NULL,
-           PRIMARY KEY(activity_start, account_id, kind, slot))"""
-    )
+    conn.execute(_REWARD_SCHEMA)
+    migrate_reward_ledger(conn)
 
 
 def record_clear(server, session, *, now: float | None = None) -> bool:
     """Record a run only after the server has authorized standard dungeon settlement."""
-    run_id = getattr(session, "weekly_attendance_run_id", None)
-    if not run_id or getattr(session, "dungeon_clear_phase", 0) != 1:
+    run = getattr(session, "weekly_attendance_run", None)
+    if not run or not getattr(session, "in_dungeon_run", False) or getattr(session, "dungeon_clear_phase", 0) != 1:
         return False
-    start = activity_start()
+    run_id, dungeon_id, start = run
+    if start != activity_start() or dungeon_id != getattr(session, "selected_dungeon_id", 0):
+        return False
     week = current_week(start, time() if now is None else now)
     if not week:
         return False
@@ -186,7 +222,8 @@ def settle(server, session, action: Action, expected_week: int = 0, *, now: floa
         for target in targets:
             item = WEEKLY_ITEMS[target - 1] if kind == "week" else MILESTONE_ITEMS[target]
             ok, _, item_slot = repo.grant_inventory_item(
-                cid, item, 1, list_type=0, require_full_capacity=True,
+                cid, item, 1, list_type=0, expire_time=start + len(WEEKLY_ITEMS) * WEEK_SECONDS,
+                require_full_capacity=True,
             )
             if not ok or item_slot < 0:
                 raise AttendanceError("请确认消耗品栏有空位后重试。")
@@ -198,3 +235,52 @@ def settle(server, session, action: Action, expected_week: int = 0, *, now: floa
         if bag_slots:
             status = _read_status(conn, scope, week)
         return status, tuple(bag_slots)
+
+
+def redeem_armor_voucher(server, session, voucher_slot: int, armor_slot: int):
+    """Consume one original voucher and replace the selected piece in place."""
+    if not 3 <= voucher_slot < 0xFFFF or not 9 <= armor_slot < 0xFFFF or voucher_slot == armor_slot:
+        raise AttendanceError("invalid_inventory_slots")
+    voucher_meta = resolve_item_metadata(ARMOR_VOUCHER)
+    ids = voucher_meta.action_values
+    if voucher_meta.action_type != "[equipment item period change]" or len(ids) != 100 or len(set(ids)) != 100:
+        raise AttendanceError("original_voucher_pair_table_unavailable")
+    pairs = dict(zip(ids[::2], ids[1::2], strict=True))
+    now = int(time())
+    repo = server._repo()
+    with repo.inventory_transaction_scope() as conn:
+        cid = identity(server, session, conn)
+        main = repo.INVENTORY_LIST_MAIN
+        voucher = repo.get_inventory_item_at(cid, list_type=main, slot_index=voucher_slot, now_unix=now)
+        if (not voucher or voucher["item_template_id"] != ARMOR_VOUCHER or voucher["stack_count"] < 1
+                or voucher["expire_time"] <= now):
+            raise AttendanceError("voucher_unavailable")
+        armor = repo.get_inventory_item_at(cid, list_type=main, slot_index=armor_slot, now_unix=now)
+        if (not armor or armor["item_kind"] != "equipment"
+                or armor["stack_count"] != 1 or armor["expire_time"] <= now or armor["equipment_lock_id"]):
+            raise AttendanceError("selected_armor_unavailable")
+        armor_id = armor["item_template_id"]
+        permanent_id = pairs.get(armor_id)
+        if permanent_id is None:
+            raise AttendanceError("armor_not_eligible")
+        temporary = resolve_item_metadata(armor_id)
+        permanent = resolve_item_metadata(permanent_id)
+        if (not temporary.is_equipment or not permanent.is_equipment
+                or temporary.minimum_level != 85 or permanent.minimum_level != 85
+                or temporary.equipment_type != permanent.equipment_type or temporary.name != permanent.name
+                or temporary.usable_period_days <= 0 or permanent.usable_period_days
+                or permanent.expiration_timestamp or permanent.daily_delete):
+            raise AttendanceError("invalid_equipment_pair")
+        ok, _, consumed = repo.consume_inventory_item(cid, list_type=main, slot_index=voucher_slot, count=1)
+        if not ok or consumed["removed"] != 1 or consumed["item_template_id"] != ARMOR_VOUCHER:
+            raise AttendanceError("voucher_consume_failed")
+        if conn.execute(
+            """UPDATE character_items SET item_template_id=?, expire_time=0, updated_at=CURRENT_TIMESTAMP
+               WHERE item_uid=? AND character_id=? AND list_type=? AND slot_index=? AND item_template_id=?""",
+            (permanent_id, armor["item_uid"], cid, main, armor_slot, armor_id),
+        ).rowcount != 1:
+            raise AttendanceError("armor_replace_failed")
+        armor_update = repo.get_inventory_item_at(cid, list_type=main, slot_index=armor_slot, now_unix=now)
+        if not armor_update or armor_update["item_template_id"] != permanent_id or armor_update["expire_time"]:
+            raise AttendanceError("armor_refresh_failed")
+        return armor_id, permanent_id

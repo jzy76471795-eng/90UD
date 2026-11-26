@@ -114,8 +114,13 @@ def build_use_stackable_ack_error(
     list_type: int = 0,
     item_template_id: int = 0,
     instance_value: int = 0,
+    native_quest_elixir: bool = False,
 ) -> bytes:
     """S1/002C 失败体（S4 UseStackableAckBuilder.BuildError）。"""
+    if native_quest_elixir:
+        # Stage3 consumes the failure code before the item-use callback
+        # reads the inventory list and two optional cooldown fields.
+        return struct.pack("<BBBii", 0, 0, int(list_type) & 0xFF, 0, 0)
     return (
         bytes([0x00, int(list_type) & 0xFF])
         + struct.pack("<i", int(item_template_id))
@@ -484,7 +489,8 @@ class UseStackable002CService:
         remaining = int(detail.get("remaining") or 0)
         if not ok or removed <= 0:
             ack = build_use_stackable_ack_error(
-                list_type=list_type, item_template_id=item_id, instance_value=instance
+                list_type=list_type, item_template_id=item_id, instance_value=instance,
+                native_quest_elixir=exp_bonus_rule is not None and exp_bonus_rule.quest_bonus,
             )
             pkt, mode = self._emit(1, 0x002C, ack)
             return [

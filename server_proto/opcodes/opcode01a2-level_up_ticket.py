@@ -49,11 +49,11 @@ def roll_level_up_ticket_increment(levelup_range: int) -> int:
 
 
 def parse_level_up_ticket_body(plain: bytes) -> dict[str, int] | None:
-    """Parse Stage3 ``i16 slot_index + u8 list_type`` exactly."""
+    """Parse the Stage3 ticket fields and the native codec's zero padding."""
     data = bytes(plain or b"")
-    if len(data) != 3:
+    if len(data) not in (3, 16) or any(data[3:]):
         return None
-    slot_index, list_type = struct.unpack("<hB", data)
+    slot_index, list_type = struct.unpack_from("<hB", data)
     if slot_index < 0:
         return None
     return {

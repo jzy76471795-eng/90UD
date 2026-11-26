@@ -91,11 +91,13 @@ def product_for_request(catalog: Catalog, word: int) -> int:
 
 
 def snapshot_rows(repo, account: int, now: int, receipt: tuple[int, int] = (0, 0)):
+    from game.character import cn2018_capsule
+
     shop = open_shop(repo)
     balances, remaining, available = shop.state(account, now)
     request_id, result = receipt
     fields = (SNAPSHOT_VERSION, balances[1], balances[2], request_id, result)
-    return (*((SNAPSHOT_START + i, value) for i, value in enumerate(fields)),
+    return (*((SNAPSHOT_START + i, value) for i, value in enumerate(fields + cn2018_capsule.view(repo, account, now))),
             *((SNAPSHOT_START + 16 + i, count if item in available else count | UNAVAILABLE_PRODUCT)
               for i, (item, count) in enumerate(remaining)))
 

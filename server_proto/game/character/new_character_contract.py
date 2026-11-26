@@ -132,16 +132,14 @@ def apply_new_character_contract(
 
     initial_skills = list(get_initial_skills_for_job(job))
     _require(bool(initial_skills), "initial_skill_fixture_missing job=%s" % job)
-    seeded_skills = int(
-        repo.seed_character_skills_if_empty(
-            cid,
-            initial_skills,
-            page=0,
-            page_header=0,
+    skill_rows = repo.load_character_skills(cid, page=0, expected_job=job)
+    seeded_skills = 0
+    if not skill_rows:
+        seeded_skills = int(
+            repo.seed_character_skills_if_empty(cid, initial_skills, page=0, expected_job=job)
+            or 0
         )
-        or 0
-    )
-    skill_rows = list(repo.load_character_skills(cid, page=0) or ())
+        skill_rows = repo.load_character_skills(cid, page=0, expected_job=job)
     _require(bool(skill_rows), "initial_skill_persist_failed job=%s" % job)
     if strict_new:
         expected_skills = {

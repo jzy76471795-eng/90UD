@@ -9,11 +9,7 @@ from typing import Any, Callable
 
 from game.chain_loader import load_chain
 from game.character.item_metadata import resolve_item_metadata
-from game.character.random_container_index import (
-    EQUIPMENT_LOTTERY_TYPE,
-    ITEM_LOTTERY_TYPE,
-    resolve_lottery_container,
-)
+from game.character.random_container_index import LOTTERY_TYPES, resolve_lottery_container
 
 
 _helper = load_chain("helper-random_container.py")
@@ -63,7 +59,7 @@ class UseLotteryItem001BService:
             return self._failure("selected_character_missing")
         repo = self.server._repo()
         account_id = _helper.account_id_for_character(repo, character_id)
-        if account_id is None:
+        if account_id is None or account_id != int(self.server.account_id or 0):
             return self._failure("character_account_missing cid=%d" % character_id)
         source = repo.get_inventory_item_at(
             character_id,
@@ -109,9 +105,10 @@ class UseLotteryItem001BService:
             expected_package_item_id=source_item_id,
             grants=grants,
             source_metadata=source_metadata,
-            allowed_source_types=(EQUIPMENT_LOTTERY_TYPE, ITEM_LOTTERY_TYPE),
+            allowed_source_types=LOTTERY_TYPES,
             enforce_reward_job_restrictions=False,
             gold_reward=reward.count if is_gold_reward else 0,
+            gold_cost=definition.gold_cost,
             activate_system_rewards=True,
             now_unix=now_unix,
         )

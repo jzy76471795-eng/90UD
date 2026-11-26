@@ -459,6 +459,8 @@ class DungeonLeaveSelectService:
                 except Exception:
                     pass
         session.dungeon_run_started_monotonic = None
+        session.adventure_season1_run = None
+        session.weekly_attendance_run = None
         session.dungeon_death_pending = False
         session.dungeon_death_actor_id = 0
         session.dungeon_run_play_time_ms = None

@@ -196,16 +196,32 @@ class GameSessionService:
         if not isinstance(body, dict):
             raise LoginApiError(400, "INVALID_REQUEST", "invalid collection request")
         action = body.get("action")
-        if action not in ("list", "set", "remove"):
+        if action not in ("list", "set", "remove", "expedition_start", "expedition_cancel", "expedition_claim"):
             raise LoginApiError(400, "INVALID_REQUEST", "unknown collection action")
         required = {"action", "token", "remote_ip"}
-        if action != "list":
+        if action in ("set", "remove"):
             required.add("character_id")
+        elif action == "expedition_start":
+            required.update(("request_id", "area_id", "hours", "members", "rotation_key"))
+        elif action in ("expedition_cancel", "expedition_claim"):
+            required.add("run_id")
         self._fields(body, required)
         identity = self._resolve({"token": body["token"], "remote_ip": body["remote_ip"]})
         character = body.get("character_id")
-        if action != "list" and (type(character) is not int or not 1 <= character <= 0xFFFFFFFF):
+        if action in ("set", "remove") and (type(character) is not int or not 1 <= character <= 0xFFFFFFFF):
             raise LoginApiError(400, "INVALID_REQUEST", "invalid collection character")
+        if action == "expedition_start":
+            for field in ("request_id", "area_id", "hours", "rotation_key"):
+                if type(body[field]) is not int or not 1 <= body[field] <= 0xFFFFFFFF:
+                    raise LoginApiError(400, "INVALID_REQUEST", "invalid expedition start value")
+            members = body["members"]
+            if (not isinstance(members, list) or not 1 <= len(members) <= 4
+                    or any(type(member) is not int or not 1 <= member <= 0xFFFFFFFF for member in members)):
+                raise LoginApiError(400, "INVALID_REQUEST", "invalid expedition members")
+        if action in ("expedition_cancel", "expedition_claim") and (
+            type(body["run_id"]) is not int or not 1 <= body["run_id"] <= 0x7FFFFFFFFFFFFFFF
+        ):
+            raise LoginApiError(400, "INVALID_REQUEST", "invalid expedition run")
         if not self._services_ready():
             raise LoginApiError(503, "SERVER_NOT_READY", "game services are not ready")
 
@@ -217,16 +233,59 @@ class GameSessionService:
         except (KeyError, FileNotFoundError, ValueError):
             raise LoginApiError(503, "COLLECTION_UNAVAILABLE", "CN collection configuration is unavailable") from None
         service = CN2018Expedition(self.game_server._repo(), index)
+        operation = None
         try:
             if action == "set":
                 service.set_representative(identity.account_id, character)
             elif action == "remove" and not service.remove_representative(identity.account_id, character):
                 raise ExpeditionRejected("collection_representative_missing")
+            elif action == "expedition_start":
+                operation = service.start(identity.account_id, str(body["request_id"]), body["area_id"],
+                                          body["hours"], members, body["rotation_key"])
+            elif action == "expedition_cancel":
+                operation = service.cancel(identity.account_id, body["run_id"])
+            elif action == "expedition_claim":
+                operation = service.claim(identity.account_id, body["run_id"])
         except ExpeditionRejected as exc:
             raise LoginApiError(409, "COLLECTION_REJECTED", str(exc)) from None
-        return {"characters": service.collection_view(identity.account_id)}
+        if action == "expedition_claim":
+            refresh_wallet = getattr(self.game_server, "_refresh_adventure_expedition_wallet", None)
+            if callable(refresh_wallet):
+                refresh_wallet(identity, body["run_id"])
+        status = service.status(identity.account_id)
+        attributes = {area: tuple(index.attributes[attribute] for attribute in required)
+                      for area, required in status.pop("rotation").items()}
+        for run in status["runs"]:
+            run["required_attributes"] = tuple(index.attributes[value] for value in run["required_attributes"])
+        return {"characters": service.collection_view(identity.account_id),
+                "expedition_attributes": attributes, "expedition": status,
+                "expedition_operation": operation}
 
     def dispatch(self, action, body):
+        if action == "adventure_operation":
+            if not isinstance(body, dict) or body.get("action") not in (
+                "state", "buy", "use_capsule", "weekly_status", "weekly_sign", "weekly_make_up", "weekly_claim",
+            ):
+                raise LoginApiError(400, "INVALID_REQUEST", "invalid adventure action")
+            fields = {"action", "request_id"}
+            if body["action"] not in ("state", "weekly_status"):
+                fields.update(("character_id", "connection_generation"))
+            if body["action"] in ("buy", "use_capsule"):
+                fields.add("quantity")
+            if body["action"] == "buy":
+                fields.add("item_id")
+            if body["action"] in ("weekly_sign", "weekly_make_up"):
+                fields.add("week")
+            self._fields(body, fields | {"token", "remote_ip"})
+            for name in fields - {"action"}:
+                limit = {"quantity": 99, "week": 10}.get(name, 0xFFFFFFFF)
+                if type(body[name]) is not int or not 1 <= body[name] <= limit:
+                    raise LoginApiError(400, "INVALID_REQUEST", "invalid adventure operation value")
+            identity = self._resolve({"token": body["token"], "remote_ip": body["remote_ip"]})
+            operation = getattr(self.game_server, "_adventure_group_operation", None)
+            if not self._services_ready() or not callable(operation):
+                raise LoginApiError(503, "SERVER_NOT_READY", "game services are not ready")
+            return operation(identity, {name: body[name] for name in fields})
         if action == "meta":
             self._fields(body, {"advertise_host"})
             host = str(ipaddress.IPv4Address(body["advertise_host"]))

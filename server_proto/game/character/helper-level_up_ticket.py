@@ -44,14 +44,16 @@ class LevelUpTicketRule:
     maximum_level: int
     levelup_range: int
     source_path: str = ""
+    minimum_level: int = 1
 
     def __post_init__(self) -> None:
         item_id = int(self.item_id) & 0xFFFFFFFF
         maximum_level = int(self.maximum_level)
+        minimum_level = int(self.minimum_level)
         levelup_range = int(self.levelup_range)
         if item_id <= 0:
             raise ValueError("level-up ticket item id must be positive")
-        if not 1 <= maximum_level <= 255:
+        if not 1 <= minimum_level <= maximum_level <= 255:
             raise ValueError(
                 "level-up ticket maximum level is invalid item=%d level=%d"
                 % (item_id, maximum_level)
@@ -63,13 +65,14 @@ class LevelUpTicketRule:
             )
         object.__setattr__(self, "item_id", item_id)
         object.__setattr__(self, "maximum_level", maximum_level)
+        object.__setattr__(self, "minimum_level", minimum_level)
         object.__setattr__(self, "levelup_range", levelup_range)
         object.__setattr__(self, "source_path", str(self.source_path or ""))
 
     def allows_current_level(self, level: int, *, character_cap: int) -> bool:
         current = max(1, int(level))
         cap = max(1, int(character_cap))
-        return current <= self.maximum_level and current < cap
+        return self.minimum_level <= current <= self.maximum_level and current < cap
 
     def target_level(
         self,
@@ -114,6 +117,7 @@ def parse_level_up_ticket_rule(
         maximum_level=maximum_level,
         levelup_range=levelup_range,
         source_path=source_path,
+        minimum_level=_single_int(text, "minimum level") or 1,
     )
 
 

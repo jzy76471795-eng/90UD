@@ -624,7 +624,9 @@ def _pack_common_inventory_entry108(item: InventoryItemLike) -> bytes:
         max(0, int(getattr(item, "amplify_value", 0) or 0)) & 0xFFFF,
     )
     struct.pack_into("<I", row, 22, marker)
-    struct.pack_into("<I", row, 43, expire)
+    # Stage3 0x019E0298 copies entry+0x38 to the item expiration field.
+    # The inventory tooltip compares this absolute Unix time against client time.
+    struct.pack_into("<I", row, 0x38, expire)
     # Stage3 item_instance_from_entry108_19DF7A0 projects entry+76 into the
     # temporary attribute map at +120. sub_1B4F360 copies that map to the
     # runtime item at +4312, which sub_28A29C0 reads for DSTR 30249.

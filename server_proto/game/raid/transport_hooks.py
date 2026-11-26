@@ -6,11 +6,11 @@ their accepted 0027 branches. This module never parses client completion flags.
 """
 
 from dataclasses import dataclass, field
-from threading import RLock
+from threading import RLock, local
 from uuid import uuid4
 
-from .dungeon_adapter import BridgeError
-from .runtime import RaidError, RaidEventExpired
+from .dungeon_adapter import BridgeError, HatcheryClosed
+from .runtime import ANTON_HEART_DUNGEON, ANTON_VOLCANO_DUNGEON, RaidError, RaidEventExpired
 from .shared_world import SharedRunWorld
 
 
@@ -45,6 +45,8 @@ class _Scope:
     deaths: dict = field(default_factory=dict)
     world: object = None
     replaced_binding: object = None
+    hatchery_source: object = None
+    hatchery_reservation: object = None
 
 
 @dataclass
@@ -54,6 +56,7 @@ class _Group:
     sessions: dict = field(default_factory=dict)
     accepted: bool = False
     world: object = None
+    hatchery_source: object = None
 
 
 @dataclass
@@ -80,6 +83,7 @@ class _SharedDeath:
     room: object
     row: object
     identity: object
+    loading_cycle: int
 
 
 _RELEVANT = {
@@ -101,6 +105,7 @@ class RaidTransportHooks:
         self._scopes, self._groups, self._receipts, self._pending, self._lives = {}, {}, {}, {}, {}
         self._notifications = {}
         self._shared_deaths = {}
+        self._death_delivery = local()
         self._hatchery_warps = {}
         self._rejected_entries = {}
         self._lock = RLock()
@@ -257,6 +262,12 @@ class RaidTransportHooks:
             group_key = self._group_key(raid, dgn, ids)
             group = self._groups.get(group_key)
             warp = self._hatchery_warps.get(id(session))
+            hatchery_source = None
+            if warp is not None and warp[4] and warp[3] is not None:
+                hatchery_source = warp[1]
+                previous_key, pending = self._pending_hatchery(hatchery_source.ticket, dgn)
+                if pending is not None:
+                    group_key, group = previous_key, pending
             if (group is not None and warp is not None and warp[3] is None
                     and group.ticket is warp[1].ticket):
                 if len(ids) != 1:
@@ -266,13 +277,18 @@ class RaidTransportHooks:
                 self._groups.pop(group_key, None)
                 group = None
             ticket = group.ticket if group is not None and not group.accepted else None
-            checked_raid, checked_ids = self.battle.guard_dungeon_entry(session, dgn, shared_ticket=ticket)
+            if hatchery_source is not None:
+                self._refresh_hatchery_departures(session, hatchery_source.ticket, dgn)
+                checked_raid, checked_ids = self.battle.guard_dungeon_entry(
+                    session, dgn, shared_ticket=ticket, hatchery_source=hatchery_source)
+            else:
+                checked_raid, checked_ids = self.battle.guard_dungeon_entry(session, dgn, shared_ticket=ticket)
             if checked_raid is not raid or tuple(sorted(checked_ids)) != tuple(sorted(ids)):
                 raise BridgeError("entry guard changed the owned raid/group snapshot")
             if warp is not None:
                 if (warp[0] is not session or not warp[4] or dgn != warp[2]
                         or (warp[3] is not None and
-                            self.bridge.hatchery_portal(session, warp[1]) != warp[2:4])):
+                            self.bridge.hatchery_portal(session, warp[1], pending_ticket=ticket) != warp[2:4])):
                     raise BridgeError('native navigation SELECT differs from its accepted target')
                 if warp[1].ticket.dungeon_id == dgn:
                     batch = self._retire(session, warp[1], 'replaced_run')
@@ -280,6 +296,10 @@ class RaidTransportHooks:
                         self._queue_notification(session, batch)
                 else:
                     scope.replaced_binding = warp[1]
+            scope.hatchery_source = hatchery_source
+            if hatchery_source is not None and ticket is None:
+                ticket = self.bridge.reserve_hatchery_entry(raid, session, hatchery_source, dgn, ids)
+                scope.hatchery_reservation = ticket
             scope.entry = (raid, dgn, ids, ticket, group_key)
             return scope.entry
 
@@ -317,7 +337,8 @@ class RaidTransportHooks:
             self._receipts[receipt.capability] = receipt
             self._pending[pending_key] = receipt
 
-    def handle_opcode(self, opcode, ordinary, body, *, session=None, party_leave=False, **kwargs):
+    def handle_opcode(self, opcode, ordinary, body, *, session=None, party_leave=False,
+                      preserve_hatchery_rejection=False, **kwargs):
         """Native wrapper replacement, forwarding ordinary input/output unchanged."""
         with self._lock:
             if session is None:
@@ -379,7 +400,9 @@ class RaidTransportHooks:
                     self.bridge._check(self.bridge._record(session, binding))
                     target, room = int.from_bytes(raw[:4], 'little'), None
                     if 221 <= target <= 224:
-                        actual, room = self.bridge.hatchery_portal(session, binding, native_activation=True)
+                        _, pending = self._pending_hatchery(binding.ticket, target) if warp[3] is not None else (None, None)
+                        actual, room = self.bridge.hatchery_portal(session, binding, native_activation=True,
+                            pending_ticket=pending.ticket if pending is not None else None)
                         if actual != target:
                             raise BridgeError('hatchery preselect differs from its native portal')
                     else:
@@ -415,6 +438,11 @@ class RaidTransportHooks:
                 if binding is None and raid_channel and opcode in (0x0025, 0x0027, 0x002D, 0x002E, 0x0028, 0x0029):
                     return [], "raid_transport reject missing owned run binding"
                 if binding is not None:
+                    if opcode == 0x0027 and binding.ticket.dungeon_id == ANTON_HEART_DUNGEON:
+                        try:
+                            self.bridge.guard_heart_death(session, binding, shared_death=self.owned_death_row(session) is not None)
+                        except RaidEventExpired as exc:
+                            return [], "raid_transport reject %s" % exc
                     if opcode == 0x0025 and not self.bridge.note_loading_request(session, binding):
                         return [], "raid_transport duplicate loading request"
                     if opcode == 0x002E and not self.bridge.guard_settlement(session, binding):
@@ -456,12 +484,27 @@ class RaidTransportHooks:
                             or not getattr(session, "in_dungeon_run", False)
                             or int(getattr(session, "selected_dungeon_id", 0) or 0) != dgn):
                         raise BridgeError("native entry did not commit the guarded new run")
-                    if scope.replaced_binding is not None:
+                    departed = ()
+                    if scope.hatchery_source is not None:
+                        departed = self._refresh_hatchery_departures(session, scope.hatchery_source.ticket, dgn)
+                        if departed and scope.hatchery_reservation is not None:
+                            self.bridge.withdraw_hatchery_members(scope.hatchery_reservation, departed)
+                        ids = tuple(cid for cid in ids if cid not in departed)
+                    if scope.replaced_binding is not None and scope.hatchery_source is None:
                         batch = self._retire(session, scope.replaced_binding, 'replaced_run')
                         if batch:
                             self._queue_notification(session, batch)
-                    binding = self.bridge.bind_owned_entry(raid, session, ids, ticket=ticket)
-                    group = self._groups.setdefault(group_key, _Group(raid, binding.ticket))
+                    if scope.hatchery_source is not None:
+                        binding = self.bridge.bind_owned_entry(raid, session, ids, ticket=ticket,
+                                                               hatchery_source=scope.hatchery_source)
+                        batch = self._retire(session, scope.hatchery_source, 'replaced_run', bridge_retired=True)
+                        if batch:
+                            self._queue_notification(session, batch)
+                    else:
+                        binding = self.bridge.bind_owned_entry(raid, session, ids, ticket=ticket)
+                    source_ticket = scope.hatchery_source.ticket if scope.hatchery_source is not None else None
+                    group = self._groups.setdefault(group_key, _Group(raid, binding.ticket,
+                                                                      hatchery_source=source_ticket))
                     if group.ticket is not binding.ticket:
                         raise BridgeError("native entry raced another shared ticket")
                     group.sessions[id(session)] = (session, binding)
@@ -493,10 +536,12 @@ class RaidTransportHooks:
                 # cannot become a new rank event or another life cycle.
                 if opcode not in (0x0028, 0x0029) or event is not None:
                     self._register(session, binding, opcode, packets, life_event=event)
-                if opcode == 0x0027 and packets and scope.deaths:
+                if opcode == 0x0027 and scope.deaths and self.owned_death_row(session) is None:
                     self._queue_shared_deaths(session, binding, scope.deaths.values())
                 return result
             except RaidError as exc:
+                if preserve_hatchery_rejection and isinstance(exc, HatcheryClosed):
+                    raise
                 current = self.bridge.current(session)
                 # A rejected phase0 request remains playable. A partially
                 # committed native entry or actor-journal error retires it.
@@ -508,6 +553,8 @@ class RaidTransportHooks:
                 return [], "raid_transport reject %s" % exc
             finally:
                 self._scopes.pop(id(session), None)
+                if scope.hatchery_reservation is not None:
+                    self.bridge.abandon_unused_hatchery_entry(scope.hatchery_reservation)
 
     def _ordinary(self, handler, body, **kwargs):
         """Drop the metadata lock around account-owned resource/DB work.
@@ -558,10 +605,48 @@ class RaidTransportHooks:
         with self._lock:
             ticket, destination, room = source
             binding = self.bridge.current(session)
+            _, pending = self._pending_hatchery(ticket, destination)
             if (binding is None or binding.ticket is not ticket
-                    or self.bridge.hatchery_portal(session, binding) != (destination, room)):
+                    or self.bridge.hatchery_portal(session, binding,
+                        pending_ticket=pending.ticket if pending is not None else None) != (destination, room)):
                 raise BridgeError('raid squad hatchery source changed before entry')
             self._hatchery_warps[id(session)] = (session, binding, destination, room, True)
+
+    def _pending_hatchery(self, source, destination):
+        return next(((key, group) for key, group in self._groups.items()
+                     if group.hatchery_source is source and group.ticket.dungeon_id == destination
+                     and not group.accepted), (None, None))
+
+    def _refresh_hatchery_departures(self, session, source, destination):
+        server = self.battle.service.server
+        squad = getattr(server, 'raid_squad_runs', None)
+        if squad is not None:
+            context = squad.hatchery_departures(session)
+            if context is not None and context[0] is source and context[1] == destination:
+                self.refresh_hatchery_entry(session, *context)
+                return context[2]
+        return ()
+
+    def refresh_hatchery_entry(self, session, source, destination, departed):
+        with self._lock:
+            _, group = self._pending_hatchery(source, destination)
+            if group is None:
+                return []
+            update = self.bridge.withdraw_hatchery_members(group.ticket, departed)
+            if not update.accepted:
+                return []
+            self._mark_group_entered(group)
+            return self.battle.on_bridge_update(session, update)
+
+    def accept_volcano_boss_death(self, session, actual_actor_row):
+        with self._lock:
+            binding = self.bridge.current(session)
+            if binding is None or binding.ticket.dungeon_id != ANTON_VOLCANO_DUNGEON:
+                return True
+            scope = self._scopes.get(id(session))
+            if scope is None or scope.session is not session or scope.opcode != 0x0027:
+                raise BridgeError('Volcano boss death requires the live ordinary 0027 scope')
+            return self.bridge.accept_volcano_boss_death(session, binding, actual_actor_row)
 
     def note_actor_death(self, session, actual_actor_row):
         with self._lock:
@@ -571,7 +656,8 @@ class RaidTransportHooks:
             scope = self._scopes.get(id(session))
             if scope is None or scope.session is not session or scope.opcode != 0x0027:
                 raise BridgeError("actor death requires the live ordinary 0027 journal scope")
-            death = self.bridge.note_actor_death(session, binding, actual_actor_row)
+            death = self.bridge.note_actor_death(session, binding, actual_actor_row,
+                                                shared_death=self.owned_death_row(session) is actual_actor_row)
             scope.deaths[id(actual_actor_row)] = (actual_actor_row, death)
             return death
 
@@ -588,7 +674,8 @@ class RaidTransportHooks:
                 raise BridgeError("clear gate has no accepted actor journal from this request")
             condition = getattr(session, "dungeon_clear_condition_state", None)
             return self.bridge.note_clear_gate(session, binding, death,
-                                              condition_state=condition if getattr(condition, "bound", False) else None)
+                condition_state=condition if getattr(condition, "bound", False) else None,
+                shared_death=self.owned_death_row(session) is actual_actor_row)
 
     def _queue_shared_deaths(self, reporter, binding, deaths):
         group = self._group(binding)
@@ -596,16 +683,30 @@ class RaidTransportHooks:
             return
         for row, death in deaths:
             identity = self.resolve_shared_actor(reporter, binding, row)
-            for peer, owner, actual_row in group.world.living_peer_views(identity):
+            views = (group.world.owned_actor_views(identity)
+                     if row.get('passive_source_kind') == 'randomized_energy'
+                     else group.world.living_peer_views(identity))
+            for peer, owner, actual_row in views:
                 candidate = group.sessions.get(id(peer))
                 if peer is reporter or candidate is None or candidate[0] is not peer:
                     continue
                 peer_binding = candidate[1]
                 if self.bridge.current(peer) is not peer_binding or peer_binding.owner != owner:
                     continue
+                room = self._room(peer)
+                try:
+                    cycle, _ = self.bridge.room_loading_delivery(peer, peer_binding, room)
+                except RaidError:
+                    continue
                 key = (id(peer), identity)
                 self._shared_deaths.setdefault(key, _SharedDeath(peer, peer_binding,
-                    getattr(peer, '_raid_selected_epoch', None), self._room(peer), actual_row, identity))
+                    getattr(peer, '_raid_selected_epoch', None), room, actual_row, identity, cycle))
+
+    def owned_death_row(self, session):
+        event = getattr(self._death_delivery, 'event', None)
+        if event is not None and event.session is session:
+            return event.row
+        return None
 
     def shared_death_packets(self, session, ordinary):
         """Recipient thread only: normal XP/drop handling, never cross-account TLS.
@@ -618,13 +719,9 @@ class RaidTransportHooks:
         with self._lock:
             if not self._shared_deaths:
                 return []
-            events = []
-            for key, event in tuple(self._shared_deaths.items()):
-                if event.session is not session:
-                    continue
-                self._shared_deaths.pop(key, None)
-                events.append(event)
-        for event in events:
+            events = tuple((key, event) for key, event in self._shared_deaths.items()
+                           if event.session is session)
+        for key, event in events:
             try:
                 with self._lock:
                     binding = event.binding
@@ -634,14 +731,27 @@ class RaidTransportHooks:
                             or self._room(session) is not event.room
                             or event.row.get('killed')
                             or self.resolve_shared_actor(session, binding, event.row) is not event.identity):
+                        self._shared_deaths.pop(key, None)
                         continue
-                    self.bridge.note_room_enter(session, binding, event.room)
-                result, note = self.handle_opcode(0x0027, ordinary,
-                    event.row['seq'].to_bytes(2, 'little'), session=session)
+                    cycle, loaded = self.bridge.room_loading_delivery(session, binding, event.room, shared_death=True)
+                    if cycle != event.loading_cycle:
+                        self._shared_deaths.pop(key, None)
+                        continue
+                    if not loaded:
+                        continue
+                    self._shared_deaths.pop(key, None)
+                    self.bridge.note_room_enter(session, binding, event.room, shared_death=True)
+                self._death_delivery.event = event
+                seq = int(event.row.get('seq') or 0)
+                raw = seq.to_bytes(2, 'little') if seq else b''
+                result, _ = self.handle_opcode(0x0027, ordinary, raw, session=session)
                 packets.extend(result)
             except RaidError:
                 # A stale audience must never kill a different room actor.
-                continue
+                with self._lock:
+                    self._shared_deaths.pop(key, None)
+            finally:
+                self._death_delivery.event = None
         return packets
 
     def capture_send(self, session, packet):
@@ -703,18 +813,22 @@ class RaidTransportHooks:
                                            loading_cycle=receipt.loading_cycle)
             group = self._group(receipt.binding)
             if update.accepted:
-                group.accepted = True
-                for peer, binding in group.sessions.values():
-                    self.bridge.note_room_enter(peer, binding, self._room(peer))
+                self._mark_group_entered(group)
             elif receipt.packet_key == (0, 0x001D) and receipt.request_opcode == 0x002D:
                 self.bridge.note_room_enter(receipt.session, receipt.binding, receipt.room_state)
             if update.accepted or update.cleared:
                 notifications = self.battle.on_bridge_update(receipt.session, update)
         return notifications
 
-    def _retire(self, session, binding, reason):
+    def _mark_group_entered(self, group):
+        group.accepted = True
+        for peer, binding in group.sessions.values():
+            self.bridge.note_room_enter(peer, binding, self._room(peer))
+
+    def _retire(self, session, binding, reason, *, bridge_retired=False):
         try:
-            self.bridge.retire(session, binding, reason=reason)
+            if not bridge_retired:
+                self.bridge.retire(session, binding, reason=reason)
         finally:
             self._hatchery_warps.pop(id(session), None)
             self._rejected_entries.pop(id(session), None)

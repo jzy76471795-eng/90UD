@@ -14,7 +14,7 @@ from uuid import uuid4
 from game.chain_loader import load_chain
 from game.normal_party_run import NormalPartyRuns, Participant, Run, Cycle, Ticket
 from game.normal_party_profiles import build_profiles
-from .dungeon_adapter import OwnerIdentity
+from .dungeon_adapter import HatcheryClosed, OwnerIdentity
 from .runtime import RaidError
 
 
@@ -35,13 +35,16 @@ class _Server:
         if opcode is None:
             return handler
         def owned(body, *, session):
-            return self.hooks.handle_opcode(opcode, handler, body, session=session)
+            return self.hooks.handle_opcode(opcode, handler, body, session=session,
+                                            preserve_hatchery_rejection=opcode == 0x10)
         return owned
 
 
 @dataclass(eq=False)
 class _HatcheryCycle(Cycle):
     source: tuple = ()
+    source_run: object = None
+    requester: object = None
 
 
 class _Parties:
@@ -355,6 +358,7 @@ class RaidSquadRuns(NormalPartyRuns):
         self.completed_returns = _CompletedReturns(self)
         self.expired_returns = _ExpiredReturns(self)
         self._entry_replays = {}
+        self._party_updates = {}
         self.parties.returns = self.completed_returns
         if getattr(self.service.native_lobby, '_squad_returns', None) is not None:
             raise RaidError('raid squad return receipt observer already installed')
@@ -380,6 +384,14 @@ class RaidSquadRuns(NormalPartyRuns):
                 and seat.epoch is m.identity.generation for seat in current.members) for m in survivors)
         if valid:
             run.party = current
+            if current is not party:
+                for member in survivors:
+                    key = id(member.session)
+                    pending = self._party_updates.get(key)
+                    host_changed = current.host_character_id != party.host_character_id
+                    if pending is not None and pending[0] is run:
+                        host_changed = host_changed or pending[2]
+                    self._party_updates[key] = (run, current, host_changed)
         return valid
 
     def _start(self, body, session):
@@ -388,9 +400,14 @@ class RaidSquadRuns(NormalPartyRuns):
         with self._metadata():
             current = self._current(session)
         if current is not None:
-            if (current.active and current.dungeon_id == 218
-                    and self.hooks.native_entry_target(session) in range(221, 225)):
-                return self._start_hatchery(body, session, current)
+            if current.active and current.dungeon_id == 218:
+                target = self.hooks.native_entry_target(session)
+                if target in range(221, 225):
+                    return self._start_hatchery(body, session, current)
+                if target is None and self.hooks.has_native_entry_intent(session):
+                    # Let native SELECT reject an unconfirmed portal and
+                    # release the client's waiting UI, as on the solo path.
+                    return None
             if getattr(session, 'in_dungeon_run', False) or current.active:
                 return [], 'raid squad entry already queued or active'
             return [], 'raid squad cancellation pending'
@@ -440,6 +457,8 @@ class RaidSquadRuns(NormalPartyRuns):
 
     def _start_hatchery(self, body, session, current):
         with self._metadata():
+            if not self._valid(current):
+                raise RaidError('raid squad membership changed before hatchery entry')
             first = self._member(current, session)
             if current.party.host_character_id != first.character_id:
                 return [], 'raid hatchery entry waits for the squad host'
@@ -455,7 +474,8 @@ class RaidSquadRuns(NormalPartyRuns):
         if (parsed['difficulty'] not in range(6)
                 or requested not in (0, dungeon) and not (requested and requested > 0x1000)):
             raise RaidError('raid squad SELECT disagrees with its hatchery entrance')
-        cycle = _HatcheryCycle('entry', raw, self.parties.clock() + 30, first=first, source=source)
+        cycle = _HatcheryCycle('entry', raw, self.parties.clock() + 30, first=first, source=source,
+                               source_run=current, requester=first)
         run = Run(current.party, members, dungeon, None, Ticket(uuid4().hex, dungeon, members), cycle)
         with self._metadata():
             if (current.cycle is not old_cycle or old_cycle.room != room or not self._valid(current)
@@ -492,6 +512,8 @@ class RaidSquadRuns(NormalPartyRuns):
         return super().forget(session)
 
     def pump(self, session, client):
+        if self.original.account_id != getattr(session, 'account_id', None):
+            return
         self.expired_returns.pump(session, client)
         self.completed_returns.pump(session, client)
         replay = self._entry_replays.get(id(session))
@@ -507,20 +529,62 @@ class RaidSquadRuns(NormalPartyRuns):
                 self._entry_replays.pop(id(session), None)
                 packets, _note = self._start(raw, session)
                 for packet in packets:self._sender(self._member(self._current(session),session),client).sendall(packet)
-        return super().pump(session, client)
+        context = self.hatchery_departures(session)
+        if context is not None:
+            for packet in self.hooks.refresh_hatchery_entry(session, *context):
+                self._sender(self._member(self._current(session), session), client).sendall(packet)
+        result = super().pump(session, client)
+        self._publish_active_party(session, client)
+        return result
+
+    def _publish_active_party(self, session, client):
+        key = id(session)
+        with self._metadata():
+            pending = self._party_updates.get(key)
+            if pending is None:
+                return
+            run, party, host_changed = pending
+            if self._current(session) is not run or not run.active:
+                self._party_updates.pop(key, None)
+                return
+            member = self._member(run, session)
+            if (member.selection[0].client is not client or not self._scene(run, member)
+                    or member.selection[0] not in run.cycle.projected or run.party is not party):
+                return
+            roster = self.parties._roster(party)
+            host_slot = next(seat.slot for seat in party.members if seat.character_id == party.host_character_id)
+        sender = self._sender(member, client)
+        sender.sendall(self.original._codec_response(0, 9, roster))
+        if host_changed:
+            sender.sendall(self.original._codec_response(0, 0x1a, bytes((host_slot,))))
+        with self._metadata():
+            if self._party_updates.get(key) is pending:
+                self._party_updates.pop(key, None)
 
     def detach(self, session):
-        # Before first acceptance the bridge owns a ticket for every original
-        # participant. Cancel that pending run together; never release a subset
-        # while its bridge still waits forever for an already retired owner.
+        # A portal handoff can retain its current Energy survivors. Normal
+        # first entry still requires every member of the frozen roster.
         with self._metadata():
+            self._party_updates.pop(id(session), None)
             run = self._current(session)
+            if run is not None and isinstance(run.cycle, _HatcheryCycle):
+                return super().detach(session, continue_entry=True)
             if run is not None and run.active:
                 records = [self.hooks.bridge._records.get(id(m.session)) for m in self._members(run)]
                 if any(r is not None and not self.hooks.bridge._groups[r.binding.ticket.run_id].accepted
                        for r in records):
                     self._cancel(run, 'raid member left before initial loading acceptance')
             return super().detach(session, continue_move=True)
+
+    def hatchery_departures(self, session):
+        with self._metadata():
+            run = self._current(session)
+            if (run is None or not run.active or not run.departed
+                    or not isinstance(run.cycle, _HatcheryCycle)):
+                return None
+            source, destination, _ = run.cycle.source
+            return source, destination, tuple(m.character_id for m in run.participants
+                                              if m.selection[0] in run.departed)
 
     def confirm_town(self, session):
         if self.hooks.bridge.current(session) is None and not getattr(session, 'in_dungeon_run', False):
@@ -535,8 +599,49 @@ class RaidSquadRuns(NormalPartyRuns):
                 if (not self._owned(run, member) or member.selection[0] in cycle.prepared
                         or member.selection[0] in cycle.preparing):
                     return
-            self.hooks.arm_squad_hatchery(member.session, cycle.source)
+                if member is not cycle.first and cycle.first.selection[0] not in cycle.prepared:
+                    self._queue(member, 'prepare', run, cycle)
+                    return
+            try:
+                self.hooks.arm_squad_hatchery(member.session, cycle.source)
+                return super()._prepare(member, run, cycle, client)
+            except HatcheryClosed:
+                if not self._restore_energy_before_handoff(run, cycle):
+                    raise
+                if member is cycle.requester:
+                    self._sender(member, client).sendall(self.original._codec_response(1, 0x10, b'\0\x13\0'))
+                return
         return super()._prepare(member, run, cycle, client)
+
+    def _commit_prepared(self, run, cycle):
+        if isinstance(cycle, _HatcheryCycle):
+            # The first prepared connection may leave before its peers begin.
+            # Preserve the Energy run until every remaining connection moves.
+            cycle.source_run = None
+        super()._commit_prepared(run, cycle)
+
+    def _restore_energy_before_handoff(self, run, cycle):
+        with self._metadata():
+            source = cycle.source_run
+            members = self._members(run)
+            if (source is None or not run.active or run.cycle is not cycle or cycle.preparing
+                    or cycle.prepared or cycle.committed or not members
+                    or any(self._current(m.session) is not run
+                           or getattr(m.session, 'selected_dungeon_id', None) != source.dungeon_id
+                           or source.generations.get(m.selection[0]) != getattr(m.session, 'dungeon_run_generation', None)
+                           for m in members)):
+                return False
+            if any(self._current(m.session) is not None for m in run.participants if m.selection[0] in run.departed):
+                return False
+            run.active = False
+            source.active = True
+            for member in run.participants:
+                self._runs[id(member.session)] = (member.session, source)
+                if member.selection[0] in run.departed:
+                    super().detach(member.session)
+                else:
+                    self._jobs.pop(member.selection[0], None)
+            return True
 
     def _stage_start(self, m, run, cycle, client):
         return super()._stage_start(m, run, cycle, self._sender(m, client))

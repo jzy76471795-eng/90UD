@@ -32,9 +32,21 @@ class PartyReturns:
     def forget(self, session):
         self.pending.pop(id(session), None)
         self.jobs.pop(id(session), None)
-        for key, (_, _, roster, _, _) in tuple(self.waiting.items()):
-            if any(ticket.owner[0].session is session for ticket in roster):
-                self.waiting.pop(key, None)
+        self.waiting.pop(id(session), None)
+
+    def _remaining_return_members(self, wait, owner):
+        members, roster, _, _ = wait
+        leader = roster[0]
+        current = tuple(leader.party.members.values())
+        if (leader.owner != owner or leader.party.owner != owner
+                or not all(member in members for member in current)):
+            return None
+        retained = tuple(ticket for ticket in roster if ticket.owner in current)
+        if (not retained or retained[0] is not leader
+                or not all(self._current(t) and getattr(t.owner[0].session, 'in_dungeon_run', False)
+                           for t in retained)):
+            return None
+        return retained
 
     def _handler(self, opcode):
         if opcode == 0x48:
@@ -63,15 +75,20 @@ class PartyReturns:
             if party is None or owner not in party.members.values() or generation <= 0:
                 return None
             if expected is not None:
-                revision, members, roster, _, _ = expected
-                if (party.owner != owner or party.revision != revision or tuple(party.members.values()) != members
-                        or not all(self._current(t) and getattr(t.owner[0].session,'in_dungeon_run',False)
-                                   and int(getattr(t.owner[0].session,'dungeon_clear_phase',0) or 0) >= 2 for t in roster)):
+                if self.waiting.get(id(session)) is not expected:
+                    return None
+                retained = self._remaining_return_members(expected, owner)
+                if retained is None:
+                    self.waiting.pop(id(session), None)
+                    return None
+                if any(int(getattr(t.owner[0].session, 'dungeon_clear_phase', 0) or 0) < 2 for t in retained):
                     return None
             completed = int(getattr(session, 'dungeon_clear_phase', 0) or 0) >= 2
             keep_party = completed and party.owner == owner and not explicit_party_leave
             followers = []
-            if keep_party:
+            if expected is not None:
+                followers = retained[1:]
+            elif keep_party:
                 for member in party.members.values():
                     peer = member[0].session
                     if member != owner and getattr(peer, 'in_dungeon_run', False):
@@ -79,7 +96,7 @@ class PartyReturns:
                             int(getattr(peer, 'dungeon_run_generation', 0) or 0), True))
             ticket = ReturnTicket(owner, party, generation, keep_party)
             if keep_party and any(int(getattr(f.owner[0].session, 'dungeon_clear_phase', 0) or 0) < 2 for f in followers):
-                self.waiting.setdefault(id(session), (party.revision, tuple(party.members.values()),
+                self.waiting.setdefault(id(session), (tuple(party.members.values()),
                     (ticket, *followers), opcode, bytes(body)))
                 return [], 'completed group return queued until every member result'
             self.waiting.pop(id(session), None)
@@ -111,16 +128,13 @@ class PartyReturns:
         with parties._lock:
             wait = self.waiting.get(id(session))
             if wait is not None:
-                revision, members, roster, opcode, body = wait
-                ticket = roster[0]
+                _, _, opcode, body = wait
                 if owner[0].client is not client or parties.server.account_id != owner[2]:
                     return
-                if (ticket.owner != owner or ticket.party.owner != owner or ticket.party.revision != revision
-                        or tuple(ticket.party.members.values()) != members
-                        or not all(self._current(t) and getattr(t.owner[0].session,'in_dungeon_run',False) for t in roster)):
+                retained = self._remaining_return_members(wait, owner)
+                if retained is None:
                     self.waiting.pop(id(session), None)
-                elif all(int(getattr(t.owner[0].session, 'dungeon_clear_phase', 0) or 0) >= 2 for t in roster):
-                    self.waiting.pop(id(session), None)
+                elif all(int(getattr(t.owner[0].session, 'dungeon_clear_phase', 0) or 0) >= 2 for t in retained):
                     resume = True
         if resume:
             result = self.leave(opcode, body, session, expected=wait)

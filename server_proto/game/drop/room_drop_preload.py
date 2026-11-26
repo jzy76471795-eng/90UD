@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable, List, Optional, Sequence
 
 from game.chain_loader import load_chain
+from game.character.adventure_group import calculate_adventure_group_benefits_for_account
 from game.drop.drop_service import (
     bind_passive_object_item_entries,
     generate_monster_drop_result,
@@ -20,6 +21,7 @@ from game.drop.models import (
 from game.drop.wish_service import valid_wish_item_ids
 from game.quest.quest_index import get_quest_index, passive_object_items_for_maze
 from game.shop.premium_contract_index import get_active_premium_effects
+from pvf.adventure_group_index import cn_adventure_traits_enabled
 
 
 _map_actors = load_chain("helper-dungeon_map_monsters.py")
@@ -294,6 +296,7 @@ def _generate_hell_result(
     special_hell_final_boss: bool,
     include_independent: bool,
     include_group_reward: bool,
+    epic_piece_bonus_count: int = 0,
 ) -> MonsterDropResult:
     return generate_monster_drop_result(
         session,
@@ -316,6 +319,7 @@ def _generate_hell_result(
         independent_drop_rate_bonus_percent=independent_bonus,
         include_hell_independent_drop=bool(include_independent),
         include_hell_group_reward=bool(include_group_reward),
+        epic_piece_bonus_count=epic_piece_bonus_count,
     )
 
 
@@ -374,6 +378,16 @@ def preload_visible_room_drops(
         if eligible_non_passive
         else 0
     )
+    epic_piece_bonus_count = 0
+    if cn_adventure_traits_enabled() and (
+        _special_hell_boss_room(session) or any(actor.get("is_hell_party_actor") for actor in actors)
+    ):
+        repo = server._repo()
+        cid = _int_field(session, "selected_character_id")
+        account_id = int(repo.get_account_id_for_character(cid) or 0) if cid > 0 else 0
+        if account_id > 0 and account_id == int(getattr(server, "account_id", 0) or 0):
+            benefits = calculate_adventure_group_benefits_for_account(repo, account_id)
+            epic_piece_bonus_count = benefits.epic_piece_bonus_count
 
     special_items: list[Any] = []
     if any(_map_actors.is_passive_actor(actor) for actor in actors):
@@ -476,6 +490,7 @@ def preload_visible_room_drops(
                 special_hell_final_boss=False,
                 include_independent=False,
                 include_group_reward=True,
+                epic_piece_bonus_count=epic_piece_bonus_count,
             )
             bundle = PreloadedDropBundle(result=result, scope="hell_group")
             _attach_group_bundle(group_actors, bundle)
@@ -563,6 +578,7 @@ def preload_visible_room_drops(
                     special_hell_final_boss=True,
                     include_independent=False,
                     include_group_reward=True,
+                    epic_piece_bonus_count=epic_piece_bonus_count,
                 )
                 existing = PreloadedDropBundle(
                     result=result,

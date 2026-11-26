@@ -9,6 +9,7 @@ management-point system and is intentionally not used here.
 """
 from __future__ import annotations
 
+import os
 import re
 import threading
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from pvf import pvf_runtime
 
 
 ADVENTURER_SYSTEM_PATH = "etc/adventurersystem/adventurersystem.etc"
+CN_TRAITS_PATH = "etc/adventurersystem/adventurersystem2018.etc"
 HONOR_LEVEL_PATH = "etc/honorlevel.etc"
 _MAX_LEVEL = "max adventure level"
 _EXP_RATE = "adventure exp rate"
@@ -74,6 +76,9 @@ class AdventureGroupBenefits:
     tower_despair_extra_entries: int = 0
     tower_grief_extra_entries: int = 0
     weekly_dungeon_extra_entries: int = 0
+    weekly_dungeon_extra_characters: int = 0
+    guild_war_shop_item_id: int = 0
+    guild_war_shop_extra_purchases: int = 0
 
     @property
     def attributes(self) -> AdventureGroupAttributes:
@@ -360,6 +365,8 @@ def _tag_bodies(text: str, tag: str) -> Tuple[str, ...]:
 def _parse_benefits(
     text: str,
     max_adventure_level: int,
+    *,
+    cn_traits: bool = False,
 ) -> Tuple[Tuple[int, AdventureGroupBenefits], ...]:
     blocks = tuple(
         match.group(1)
@@ -437,17 +444,27 @@ def _parse_benefits(
             observed_keys = set()
             for body in _tag_bodies(block, category):
                 tokens = _script_tokens(body)
-                if len(tokens) != 5:
+                key = tokens[1].strip().lower() if len(tokens) > 1 else ""
+                guild_limit = cn_traits and (category, key) == ("item", "shop purchase count")
+                if len(tokens) != (6 if guild_limit else 5):
                     raise ValueError(
                         "[attribute] level=%d [%s] tokens=%r"
                         % (expected_level, category, tokens)
                     )
-                key = tokens[1].strip().lower()
                 field_name = _BENEFIT_FIELD_BY_KEY.get((category, key))
+                if guild_limit:
+                    field_name = "guild_war_shop_extra_purchases"
+                elif cn_traits and (category, key) == ("etc", "add day of dungeon enter count"):
+                    field_name = "weekly_dungeon_extra_characters"
                 try:
                     source_level = int(tokens[0], 10)
                     numeric_value = float(tokens[2])
                     display_mode = int(tokens[4], 10)
+                    if guild_limit:
+                        item_id = int(tokens[5], 10)
+                        if item_id <= 0 or display_mode != 1:
+                            raise ValueError("invalid guild shop item")
+                        values_by_field["guild_war_shop_item_id"] = item_id
                 except ValueError:
                     raise ValueError(
                         "[attribute] level=%d [%s] numeric field invalid"
@@ -474,6 +491,11 @@ def _parse_benefits(
                     )
                 observed_keys.add(key)
                 values_by_field[field_name] = int(numeric_value)
+        if cn_traits:
+            # CN 2018 lists the two towers together under the despair key.
+            values_by_field["tower_grief_extra_entries"] = values_by_field.get(
+                "tower_despair_extra_entries", 0
+            )
         if expected_level == 1:
             if stats:
                 raise ValueError("[attribute] level=1 must be the neutral row")
@@ -502,6 +524,8 @@ def _parse_benefits(
 def parse_adventure_group_index(
     text: str,
     honor_text: str | None = None,
+    *,
+    cn_traits_text: str | None = None,
 ) -> AdventureGroupIndex:
     source = str(text or "")
     if not source.strip():
@@ -524,7 +548,14 @@ def parse_adventure_group_index(
         honor_max_exp, expertise_exp_requirements = _parse_honor_expertise(
             honor_text
         )
-    benefits_by_level = _parse_benefits(source, max_level)
+    if cn_traits_text is None:
+        benefits_by_level = _parse_benefits(source, max_level)
+    else:
+        benefits_by_level = _parse_benefits(
+            _section(cn_traits_text, "attribute list", require_close=True),
+            max_level,
+            cn_traits=True,
+        )
     return AdventureGroupIndex(
         max_adventure_level=max_level,
         adventure_exp_rate=exp_rate,
@@ -543,6 +574,10 @@ _LOCK = threading.Lock()
 _INDEX: AdventureGroupIndex | None = None
 
 
+def cn_adventure_traits_enabled() -> bool:
+    return os.environ.get("USDOF_CN2018_SHOP") == "1"
+
+
 def get_adventure_group_index() -> AdventureGroupIndex:
     global _INDEX
     with _LOCK:
@@ -550,6 +585,8 @@ def get_adventure_group_index() -> AdventureGroupIndex:
             _INDEX = parse_adventure_group_index(
                 pvf_runtime.read_text(ADVENTURER_SYSTEM_PATH),
                 pvf_runtime.read_text(HONOR_LEVEL_PATH),
+                cn_traits_text=pvf_runtime.read_text(CN_TRAITS_PATH)
+                if cn_adventure_traits_enabled() else None,
             )
         return _INDEX
 
@@ -573,6 +610,7 @@ def warmup_adventure_group_index() -> dict[str, int | float | str]:
     result: dict[str, int | float | str] = {
         "path": ADVENTURER_SYSTEM_PATH,
         "honor_path": HONOR_LEVEL_PATH,
+        "traits_path": CN_TRAITS_PATH if cn_adventure_traits_enabled() else ADVENTURER_SYSTEM_PATH,
     }
     result.update(index.snapshot())
     return result

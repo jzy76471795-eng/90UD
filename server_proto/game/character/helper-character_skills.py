@@ -104,7 +104,7 @@ def _reconcile_growth_baseline_skills(
         return 0, "grow_baseline=load_fail:%s" % type(exc).__name__
 
     try:
-        rows = repo.load_character_skills(int(character_id), page=0)
+        rows = repo.load_character_skills(int(character_id), page=0, expected_job=job)
     except Exception as exc:
         return 0, "grow_baseline=read_fail:%s" % type(exc).__name__
 
@@ -367,7 +367,7 @@ def resolve_skills_for_character(
         )
 
     try:
-        rows = repo.load_character_skills(cid, page=0)
+        rows = repo.load_character_skills(cid, page=0, expected_job=job_i)
     except Exception as exc:
         fallback = list(get_initial_skills_for_job(job_i))
         return fallback, "skills_resolve load_fail=%r fallback_json n=%s" % (

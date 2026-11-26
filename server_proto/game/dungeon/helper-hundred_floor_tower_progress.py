@@ -5,6 +5,8 @@ import re
 import struct
 from typing import Optional
 
+from game.character.adventure_group import calculate_adventure_group_benefits_for_account
+from pvf.adventure_group_index import cn_adventure_traits_enabled
 
 TOWER_RANGES = {
     "grief": (5115, 5214),
@@ -64,21 +66,35 @@ def build_grief_progress_050e(cleared_floor: int) -> bytes:
     return struct.pack("<H", progress)
 
 
-def tower_entry_display(repo, account_id: int, entry_day: str) -> tuple[int, int, int, int]:
-    """Stage3 0545/0578/0510 use remaining and total, in despair/grief order."""
+def tower_entry_limits(repo, account_id: int) -> dict[str, int]:
     from pvf import pvf_runtime
 
-    used = repo.get_hundred_floor_tower_entries(account_id, entry_day)
-    result = []
+    limits = {}
+    benefits = (calculate_adventure_group_benefits_for_account(repo, account_id)
+                if cn_adventure_traits_enabled() and account_id > 0 else None)
     for kind in ("despair", "grief"):
         try:
             text = pvf_runtime.read_text(f"etc/towerof{kind}.etc")
         except KeyError:
-            result.extend((0, 0))
+            limits[kind] = 0
             continue
         match = re.search(r"(?im)^\[account enterable max count\]\s*\n\s*(\d+)\s*$", text)
         total = int(match[1]) if match is not None else 0
+        if total and benefits is not None:
+            total += (benefits.tower_despair_extra_entries if kind == "despair"
+                      else benefits.tower_grief_extra_entries)
         if not 0 <= total <= 127:
             raise ValueError(f"invalid account tower limit for {kind}")
+        limits[kind] = total
+    return limits
+
+
+def tower_entry_display(repo, account_id: int, entry_day: str) -> tuple[int, int, int, int]:
+    """Stage3 0545/0578/0510 use remaining and total, in despair/grief order."""
+    used = repo.get_hundred_floor_tower_entries(account_id, entry_day)
+    limits = tower_entry_limits(repo, account_id)
+    result = []
+    for kind in ("despair", "grief"):
+        total = limits[kind]
         result.extend((max(0, total - used.get(kind, 0)), total))
     return tuple(result)

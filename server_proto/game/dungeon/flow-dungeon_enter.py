@@ -83,6 +83,7 @@ from game.character.adventure_group import is_recommended_dungeon_level
 from game.chain_loader import load_chain
 from game.drop.room_drop_preload import preload_room_drops_before_visibility
 from game.quest.quest_clear import DungeonClearContext, persist_clear_map_progress
+from game.quest.adventure_season1 import begin_run as begin_adventure_season1_run
 from game.quest.weekly_attendance import begin_run as begin_weekly_attendance_run
 
 _dungeon_payloads = load_chain("helper-dungeon_payloads.py")
@@ -2305,6 +2306,33 @@ class DungeonEnter000F0010Service:
             "combined_weight": float(start.get("experience_weight") or base_w0),
             "base_weight": base_w0,
         }
+        tower_kind = tower_kind_for_dungeon(int(dungeon_id))
+        cn_tower_admitted = False
+        if tower_kind is not None and session is not None:
+            from pvf.adventure_group_index import cn_adventure_traits_enabled
+
+            if cn_adventure_traits_enabled():
+                from game.quest.quest_index import daily_quest_day_key
+
+                try:
+                    repo = self.server._repo()
+                    owner = int(repo.get_account_id_for_character(int(cid or 0)) or 0)
+                    if owner <= 0 or owner != int(self.server.account_id):
+                        refused, _ = self._emit(1, 0x0010, b"\x00\x13\x00", "codec")
+                        return [refused], "%s; reject=tower_entry_owner" % base
+                    entry_day = daily_quest_day_key()
+                    limit = _hundred_floor_progress.tower_entry_limits(repo, owner)[tower_kind]
+                    cn_tower_admitted = repo.record_hundred_floor_tower_entry(
+                        owner, tower_kind, entry_day, limit=limit
+                    )
+                    if not cn_tower_admitted:
+                        display = _hundred_floor_progress.tower_entry_display(repo, owner, entry_day)
+                        refused, _ = self._emit(1, 0x0010, b"\x00\x13\x00", "codec")
+                        packet = self.server._codec_response(0, 0x0510, bytes(display))
+                        return [refused, packet], "%s; reject=tower_entry_limit limit=%d" % (base, limit)
+                except Exception as exc:
+                    refused, _ = self._emit(1, 0x0010, b"\x00\x13\x00", "codec")
+                    return [refused], "%s; reject=tower_entry_error=%s" % (base, type(exc).__name__)
         recovery_note = self._persist_dungeon_login_recovery(
             character_id=cid,
             session=session,
@@ -2341,6 +2369,8 @@ class DungeonEnter000F0010Service:
             session.dungeon_run_generation = (
                 int(getattr(session, "dungeon_run_generation", 0) or 0) + 1
             )
+            if cn_tower_admitted:
+                session.tower_entry_display_generation = session.dungeon_run_generation
             session.dungeon_death_pending = False
             session.dungeon_death_actor_id = 0
             session.selected_dungeon_id = int(dungeon_id) & 0xFFFFFFFF
@@ -2456,6 +2486,9 @@ class DungeonEnter000F0010Service:
             session.dungeon_player_actor_key = player_actor_key
             session.dungeon_basis_level = int(start.get("basis_level") or 0)
             session.dungeon_recommended = bool(recommended_dungeon)
+            begin_adventure_season1_run(
+                session, recommended=recommended_dungeon, raid=raid_plan is not None,
+            )
             begin_weekly_attendance_run(
                 session, str(start.get("path") or ""),
                 recommended=recommended_dungeon, raid=raid_plan is not None,

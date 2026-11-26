@@ -8,6 +8,8 @@ from dataclasses import asdict
 import hashlib
 import json
 
+from game.quest.adventure_season1 import record_raid_clear
+
 
 class LedgerError(ValueError):
     pass
@@ -217,6 +219,8 @@ class RaidLedger:
                              (intent.instance_id, cid, aid, intent.family, intent.completed_at, day, week))
             conn.execute('INSERT INTO raid_clear_receipts VALUES(?,?,?)',
                          (intent.instance_id, intent.family, fingerprint))
+            for aid in sorted({aid for _, aid in members}):
+                record_raid_clear(conn, aid, intent.family, intent.instance_id, intent.completed_at)
         return True
 
     def grant_reward(self, instance_id, phase, kind, character_id, account_id, items, fingerprint):

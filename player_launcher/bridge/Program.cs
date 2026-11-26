@@ -26,9 +26,10 @@ static class Program
    if(game.StartTime.ToUniversalTime().Ticks!=boot.StartTicks||!string.Equals(game.MainModule?.FileName,boot.Exe,StringComparison.OrdinalIgnoreCase))return 5;
    using var stop=new CancellationTokenSource();game.EnableRaisingEvents=true;game.Exited+=(_,_)=>stop.Cancel();if(game.HasExited)return 0;
    using var http=Http(boot);long nextBatch=0;
+   var adventure=new Adventure();
    while(!stop.IsCancellationRequested)
    {
-    using var pipe=new NamedPipeServerStream(boot.Pipe,PipeDirection.InOut,1,PipeTransmissionMode.Message,PipeOptions.Asynchronous|PipeOptions.CurrentUserOnly,4096,4096);
+    using var pipe=new NamedPipeServerStream(boot.Pipe,PipeDirection.InOut,1,PipeTransmissionMode.Message,PipeOptions.Asynchronous|PipeOptions.CurrentUserOnly,4096,Adventure.MaxReplyBytes);
     await pipe.WaitForConnectionAsync(stop.Token);
     if(!GetNamedPipeClientProcessId(pipe.SafePipeHandle,out uint pid)||pid!=boot.Pid)continue;
     using var timeout=CancellationTokenSource.CreateLinkedTokenSource(stop.Token);timeout.CancelAfter(TimeSpan.FromSeconds(12));
@@ -37,6 +38,12 @@ static class Program
      byte[] wire=new byte[48];await pipe.ReadExactlyAsync(wire,timeout.Token);
      if(BitConverter.ToUInt32(wire)!=Magic||!CryptographicOperations.FixedTimeEquals(wire.AsSpan(4,32),Convert.FromHexString(boot.Cookie)))continue;
      var req=new Request(BitConverter.ToUInt32(wire,36),BitConverter.ToUInt32(wire,40),BitConverter.ToUInt32(wire,44));Validate(req);
+     if (req.Action >= 9)
+     {
+      var state=await adventure.Run(req,data=>Post(http,data,timeout.Token));
+      await Reply(pipe,0,state,timeout.Token);
+      continue;
+     }
      if(req.Action is 2 or 3){if(Environment.TickCount64<nextBatch)throw new InvalidOperationException("操作过快，请稍候");nextBatch=Environment.TickCount64+800;}
      var configured=await Post(http,new {action="configure",pickup=req.Pickup==1,request_id=Guid.NewGuid().ToString("N")},timeout.Token);
      string text=req.Action==1?"设置已同步":"";
@@ -65,7 +72,11 @@ static class Program
   catch(Exception){return 6;} // No credentials or auth responses in diagnostics.
   return 0;
  }
- internal static void Validate(Request r){if(r.Action<1||r.Action>8||r.Pickup>1||r.Mask>127)throw new InvalidDataException("无效的辅助请求");}
+ internal static void Validate(Request r)
+ {
+  if (r.Action is >= 1 and <= 8 && r.Pickup <= 1 && r.Mask <= 127 || Adventure.IsRequest(r)) return;
+  throw new InvalidDataException("无效的辅助请求");
+ }
  static string Str(JsonElement e,string key)=>e.TryGetProperty(key,out var v)&&v.ValueKind==JsonValueKind.String?v.GetString()??"":"";
  static string Safe(Exception e)=>e is InvalidOperationException or InvalidDataException?e.Message:"连接未完成，请稍后重试";
  static HttpClient Http(Bootstrap b)
@@ -88,8 +99,10 @@ static class Program
   if(!response.IsSuccessStatusCode){string message="辅助请求未确认";if(doc.RootElement.TryGetProperty("error",out var error))message=Str(error,"message") is {Length:>0} s?s:message;throw new InvalidOperationException(message);}
   return doc.RootElement.Clone();
  }
- static async Task Reply(Stream pipe,uint code,string text,CancellationToken stop)
+ static Task Reply(Stream pipe,uint code,string text,CancellationToken stop) =>
+  Reply(pipe,code,Encoding.UTF8.GetBytes(text.Length>120?text[..120]:text),stop);
+ static async Task Reply(Stream pipe,uint code,byte[] message,CancellationToken stop)
  {
-  byte[] message=Encoding.UTF8.GetBytes(text.Length>120?text[..120]:text);byte[] wire=new byte[12+message.Length];BitConverter.GetBytes(Magic).CopyTo(wire,0);BitConverter.GetBytes(code).CopyTo(wire,4);BitConverter.GetBytes(message.Length).CopyTo(wire,8);message.CopyTo(wire,12);await pipe.WriteAsync(wire,stop);await pipe.FlushAsync(stop);
+  byte[] wire=new byte[12+message.Length];BitConverter.GetBytes(Magic).CopyTo(wire,0);BitConverter.GetBytes(code).CopyTo(wire,4);BitConverter.GetBytes(message.Length).CopyTo(wire,8);message.CopyTo(wire,12);await pipe.WriteAsync(wire,stop);await pipe.FlushAsync(stop);
  }
 }

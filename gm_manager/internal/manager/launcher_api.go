@@ -344,12 +344,20 @@ func (l *launcherService) dispatch(ctx context.Context, r *http.Request, ip stri
 	path := r.URL.Path
 	method := r.Method
 	if path == "/launcher/v1/recharge" && method == "GET" {
-		entry,err:=readConfig(ctx,l.manager.store.db,"recharge")
-		if err!=nil{return nil,0,err}
-		if len(entry.Value)==0{return map[string]any{"enabled":false,"url":""},200,nil}
-		if err=validateRecharge(entry.Value);err!=nil{return nil,0,err}
-		if entry.Value["enabled"]!=true{return map[string]any{"enabled":false,"url":""},200,nil}
-		return map[string]any{"enabled":true,"url":entry.Value["url"]},200,nil
+		entry, err := readConfig(ctx, l.manager.store.db, "recharge")
+		if err != nil {
+			return nil, 0, err
+		}
+		if len(entry.Value) == 0 {
+			return map[string]any{"enabled": false, "url": ""}, 200, nil
+		}
+		if err = validateRecharge(entry.Value); err != nil {
+			return nil, 0, err
+		}
+		if entry.Value["enabled"] != true {
+			return map[string]any{"enabled": false, "url": ""}, 200, nil
+		}
+		return map[string]any{"enabled": true, "url": entry.Value["url"]}, 200, nil
 	}
 	if path == "/launcher/v1/meta" && method == "GET" {
 		result, err := l.meta(ctx)
@@ -396,7 +404,7 @@ func (l *launcherService) dispatch(ctx context.Context, r *http.Request, ip stri
 		return result, 200, err
 	}
 	known := map[string]bool{"/launcher/v1/sessions/current": true, "/launcher/v1/pvf/key": true, "/launcher/v1/cdk/characters": true, "/launcher/v1/cdk/redemptions": true, "/launcher/v1/announcements": true, "/launcher/v1/announcements/receipt": true, "/launcher/v1/assist": true}
-	if !known[path] && path != "/launcher/v1/party-relay/grants" && path != "/launcher/v1/adventure/collection" {
+	if !known[path] && path != "/launcher/v1/party-relay/grants" && path != "/launcher/v1/adventure/collection" && path != "/launcher/v1/adventure/operation" {
 		return nil, 404, fail(404, "NOT_FOUND", "endpoint does not exist")
 	}
 	id, err := l.identity(ctx, r, ip)
@@ -404,30 +412,8 @@ func (l *launcherService) dispatch(ctx context.Context, r *http.Request, ip stri
 		return nil, 0, err
 	}
 	switch {
-	case path == "/launcher/v1/adventure/collection" && method == "POST":
-		body, err := launcherBody(r, []string{"action"}, "character_id")
-		if err != nil {
-			return nil, 400, err
-		}
-		action, err := launcherString(body["action"], 16)
-		if err != nil || (action != "list" && action != "set" && action != "remove") {
-			return nil, 400, fail(400, "INVALID_REQUEST", "invalid collection action")
-		}
-		raw, hasCharacter := body["character_id"]
-		if (action != "list") != hasCharacter {
-			return nil, 400, fail(400, "INVALID_REQUEST", "invalid collection fields")
-		}
-		forward := map[string]any{"action": action, "token": strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "), "remote_ip": ip}
-		if hasCharacter {
-			cid, err := launcherInteger(raw, 1, 4294967295)
-			if err != nil {
-				return nil, 400, err
-			}
-			forward["character_id"] = cid
-		}
-		var result json.RawMessage
-		err = l.engine(ctx, "adventure_collection", forward, &result)
-		return result, 200, err
+	case (path == "/launcher/v1/adventure/collection" || path == "/launcher/v1/adventure/operation") && method == "POST":
+		return l.adventure(ctx, path, r, ip)
 	case path == "/launcher/v1/party-relay/grants" && method == "POST":
 		body, err := launcherBody(r, []string{"request_id"})
 		if err != nil {

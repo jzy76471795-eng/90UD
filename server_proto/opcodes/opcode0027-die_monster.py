@@ -25,14 +25,16 @@ from game.raid.local_bindings import local_raid_hooks
 
 import os
 import random
+import sqlite3
 from contextlib import nullcontext
 from typing import Any
 
 from game.chain_loader import load_chain
 from game.normal_party_run import note_actor_death as note_party_actor_death
-from game.normal_party_run import owned_death_row as owned_party_death_row
+from game.normal_party_run import owned_death_event as owned_party_death_event
 from game.character.initial_skills import get_initial_skills_for_job
 from game.character.payloads import build_skillinfo_from_pvf
+from game.quest.adventure_season1 import record_monster_defeat
 from game.quest.quest_common import env_bool
 from control.contracts import ControlApiError
 from game.quest.quest_clear import DungeonClearContext, persist_clear_map_progress
@@ -573,6 +575,7 @@ class DieMonster0027Service:
                 session=session,
                 defer_altar_progression=True,
                 defer_room_clear=True,
+                count_for_adventure=False,
             )
             packets.extend(reply)
             actor = _find_mon(session, seq)
@@ -675,11 +678,11 @@ class DieMonster0027Service:
             body = int(seq).to_bytes(2, "little")
             if raid_hooks is None:
                 reply, note = self.handle_die_monster_0027(body, session=session,
-                    defer_altar_progression=True)
+                    defer_altar_progression=True, count_for_adventure=False)
             else:
                 reply, note = raid_hooks.handle_opcode(0x0027,
                     self.handle_die_monster_0027, body, session=session,
-                    defer_altar_progression=True)
+                    defer_altar_progression=True, count_for_adventure=False)
             packets.extend(reply)
             notes.append("seq=%s %s" % (seq, note))
             mon = _find_mon(session, seq)
@@ -1064,6 +1067,7 @@ class DieMonster0027Service:
         session: Any = None,
         defer_altar_progression: bool = False,
         defer_room_clear: bool = False,
+        count_for_adventure: bool = True,
     ) -> tuple[list[bytes], str]:
         """副本实现A §5.5.2：先 0026 消亡，再经验落库 / 可选 0025 / 升级 0013 / 清房 001F。"""
         parsed = _parse_die_monster_body(body)
@@ -1084,7 +1088,7 @@ class DieMonster0027Service:
         packets: list[bytes] = []
         notes: list[str] = []
         in_run = bool(getattr(session, "in_dungeon_run", False)) if session is not None else False
-        shared_row = owned_party_death_row(self.server, session) if in_run else None
+        shared_row, adventure_key = owned_party_death_event(self.server, session) if in_run else (None, None)
         seq = parsed.get("seq") if shared_row is None else shared_row.get("seq")
         layered_scene_active = False
         if in_run:
@@ -1191,6 +1195,10 @@ class DieMonster0027Service:
                     "%s; reply=[%s]; chain_file=game/chains/opcode0027-die_monster.py"
                     % (base, ", ".join(notes))
                 )
+        raid_hooks = local_raid_hooks(self.server)
+        if (raid_hooks is not None and clear_phase == 0 and mon is not None and not mon.get("killed")
+                and not raid_hooks.accept_volcano_boss_death(session, mon)):
+            return [], "%s; raid Volcano boss death blocked by the full barrier" % base
         difficulty = 0
         dungeon_id = -1
         drop_rows: list = []
@@ -1513,12 +1521,17 @@ class DieMonster0027Service:
             )
 
         # §5.5.2 step 4: mark killed
+        adventure_eligible = (
+            (count_for_adventure if shared_row is None else adventure_key is not None)
+            and can_combat and mon_hostile and not mon_passive and bool(mon.get("wire_visible", True))
+        )
         mon["killed"] = True
-        raid_hooks = local_raid_hooks(self.server)
         if raid_hooks is not None:
             raid_hooks.note_actor_death(session, mon)
         if shared_row is None:
-            note_party_actor_death(self.server, session, mon)
+            adventure_key = note_party_actor_death(
+                self.server, session, mon, count_for_adventure=adventure_eligible,
+            )
         tournament_transition = None
         if bool(mon.get("tournament_actor")) and can_combat:
             try:
@@ -1619,6 +1632,15 @@ class DieMonster0027Service:
                     enemy_type = 1
             residual_enemy_type = int(enemy_type)
             enemy_rank = normalize_enemy_rank(mon_type, enemy_type)
+            if adventure_eligible and enemy_type in (1, 2) and enemy_rank >= 0:
+                try:
+                    if record_monster_defeat(
+                        self.server, session, sequence=int(mon["seq"]),
+                        boss=enemy_rank == 3, shared_key=adventure_key,
+                    ):
+                        notes.append("adventure_season1_defeat=1")
+                except (KeyError, TypeError, ValueError, OSError, sqlite3.Error) as exc:
+                    notes.append("adventure_season1_defeat_error=%s" % type(exc).__name__)
             with self._stage("quest_processing"):
                 k_packets, k_note = self._apply_kill_residual(
                     session=session,

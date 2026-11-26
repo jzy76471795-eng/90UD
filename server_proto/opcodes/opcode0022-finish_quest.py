@@ -25,6 +25,7 @@ S1 公共层 ``sub_1AB3810`` 剥 success 后，按 opcode 查 **mapA**
 """
 from __future__ import annotations
 
+import os
 from typing import Any, Sequence
 
 from game.character.adventure_group import (
@@ -684,6 +685,12 @@ class FinishQuest0022Service:
         level_title_grants = []
         level_title_note = ""
         if apply_economy and (exp or gold):
+            if exp and os.environ.get("USDOF_CN2018_SHOP") == "1":
+                from game.character.exp_bonus_consumable import get_active_exp_bonus_effect
+
+                effect = get_active_exp_bonus_effect(repo, int(cid), quest_bonus=True)
+                if effect is not None:
+                    exp = min(0xFFFFFFFF, exp + effect.compute_bonus_exp(exp))
             progression_result = grant_exp_to_character(
                 repo,
                 int(cid),
@@ -865,6 +872,7 @@ class FinishQuest0022Service:
                 daily_completed_on=(
                     daily_quest_day_key() if is_daily_quest_meta(meta) else None
                 ),
+                count_for_adventure=policy == "default" and not force_complete,
             )
 
         if ok:

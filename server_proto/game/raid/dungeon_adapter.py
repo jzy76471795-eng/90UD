@@ -10,10 +10,14 @@ from threading import RLock
 from time import time
 from uuid import uuid4
 
-from .runtime import CompletionProof, RaidError, RaidEventExpired
+from .runtime import CompletionProof, RaidError, RaidEventExpired, RaidMapClosed
 
 
 class BridgeError(RaidError):
+    pass
+
+
+class HatcheryClosed(BridgeError):
     pass
 
 
@@ -96,6 +100,8 @@ class _Group:
     barrier_deaths: dict = field(default_factory=dict)
     luke_machine_reports: dict = field(default_factory=dict)
     hatchery_walls: set = field(default_factory=set)
+    hatchery_source: object = None
+    withdrawn: set = field(default_factory=set)
 
 
 _ENTRY = {(0, 0x001C), (0, 0x001D)}
@@ -198,7 +204,7 @@ class RaidRunBridge:
             group.luke_machine_reports[key] = (rows[0]['code'], event)
             return True
 
-    def hatchery_portal(self, session, binding, *, native_activation=False):
+    def hatchery_portal(self, session, binding, *, native_activation=False, pending_ticket=None):
         """Target of an owned native Energy Containment portal activation.
 
         Frozen MAP/OBJ/ACT chain: 19103/18863 -> 221, 19119/18892 ->
@@ -221,7 +227,16 @@ class RaidRunBridge:
                 raise BridgeError('hatchery warp requires its loaded Energy room')
             code, target = portal
             if not any(d.dungeon_id == target and d.state == 0 for d in raid.progression.states):
-                raise BridgeError('hatchery is not open in this raid phase')
+                pending = self._groups.get(pending_ticket.run_id) if pending_ticket is not None else None
+                if (pending is None or pending.raid is not raid
+                        or pending.ticket is not pending_ticket or pending.accepted
+                        or pending.hatchery_source is not ticket or pending_ticket.dungeon_id != target
+                        or (pending_ticket.instance_id, pending_ticket.phase, pending_ticket.attempt)
+                            != (ticket.instance_id, ticket.phase, ticket.attempt)
+                        or binding.owner.character_id in pending.withdrawn
+                        or not any(member.character_id == binding.owner.character_id
+                                   for member in pending_ticket.participants)):
+                    raise HatcheryClosed('hatchery is not open in this raid phase')
             rows = tuple(getattr(session, 'dungeon_room_passive_objects', ()) or ())
             rows += tuple(getattr(session, 'dungeon_room_mons', ()) or ())
             matches = [row for row in rows if row.get('code') == code and row.get('type') == 9]
@@ -347,7 +362,7 @@ class RaidRunBridge:
             raise BridgeError("stale or foreign server run capability")
         return record
 
-    def _check(self, record, *, require_run=True):
+    def _check(self, record, *, require_run=True, finish_heart=False):
         binding, session, raid = record.binding, record.session, record.raid
         ticket = binding.ticket
         owner = self._owner(session)
@@ -363,8 +378,11 @@ class RaidRunBridge:
         if battle is None or battle.instance_id != ticket.instance_id or battle.phase != ticket.phase:
             raise ExpiredBridgeEvent("raid instance/phase changed")
         group = self._groups[ticket.run_id]
-        if battle.status != "active" and not (group.cleared and battle.status == "completed"):
-            raise ExpiredBridgeEvent("raid phase is no longer active")
+        if battle.status != "active":
+            heart_already_defeated = (finish_heart and raid.is_anton_heart(ticket) and group.accepted
+                                      and any(peer.clear_gate is not None for peer in group.records.values()))
+            if battle.status != "completed" or not (group.cleared or heart_already_defeated):
+                raise ExpiredBridgeEvent("raid phase is no longer active")
         program = raid.progression
         attempt = program.epoch if program is not None else 1
         if attempt != ticket.attempt:
@@ -375,7 +393,29 @@ class RaidRunBridge:
             raise BridgeError("current member/account differs from frozen participants")
         return group
 
-    def bind_owned_entry(self, raid, session, participants, *, ticket=None):
+    def reserve_hatchery_entry(self, raid, session, source, destination, participants):
+        with self._lock:
+            record = self._record(session, source)
+            if record.raid is not raid or self.hatchery_portal(session, source)[0] != destination:
+                raise BridgeError('hatchery reservation requires its actual open Energy entrance')
+            owner = source.owner
+            try:
+                ticket = raid.bind_run(owner.character_id, destination, participants, self._clock(),
+                                       hatchery_source=source.ticket)
+            except RaidMapClosed as exc:
+                raise HatcheryClosed('hatchery is not open in this raid phase') from exc
+            self._groups[ticket.run_id] = _Group(raid, ticket, hatchery_source=source.ticket)
+            return ticket
+
+    def abandon_unused_hatchery_entry(self, ticket):
+        with self._lock:
+            group = self._groups.get(ticket.run_id)
+            if (group is not None and group.ticket is ticket and group.hatchery_source is not None
+                    and not group.records and not group.accepted):
+                group.raid.cancel_unused_hatchery_entry(ticket)
+                self._groups.pop(ticket.run_id)
+
+    def bind_owned_entry(self, raid, session, participants, *, ticket=None, hatchery_source=None):
         """Call after owned 0010 installed its actual ordinary run context.
 
         First member mints a ticket; followers MUST reuse that same ticket.
@@ -384,7 +424,7 @@ class RaidRunBridge:
         # Resolve server membership before acquiring the bridge lock. Raid
         # service mutation paths must never wait in reverse lock order.
         authority = (self._ordinary_authorizer(raid, session, tuple(participants))
-                     if ticket is None and self._ordinary_authorizer is not None else None)
+                     if ticket is None and hatchery_source is None and self._ordinary_authorizer is not None else None)
         with self._lock:
             owner = self._owner(session)
             if owner.channel_id != self._channels.get(raid.family):
@@ -403,6 +443,16 @@ class RaidRunBridge:
             states = getattr(session, "dungeon_room_states", None)
             self._room(session, states.get(initial_key) if isinstance(states, dict) else None)
             previous = self._records.get(id(session))
+            if hatchery_source is not None:
+                source = self._record(session, hatchery_source)
+                source_group = self._groups[hatchery_source.ticket.run_id]
+                if (source.raid is not raid or source.binding.owner != owner
+                        or source.binding.run_generation >= generation or not source_group.accepted
+                        or hatchery_source.ticket.dungeon_id != 218 or dungeon not in range(221, 225)):
+                    raise BridgeError('hatchery handoff lost its Energy binding')
+                target = self._groups.get(ticket.run_id) if ticket is not None else None
+                if target is None or target.hatchery_source is not hatchery_source.ticket:
+                    raise BridgeError('hatchery entry has no reservation for its Energy run')
             if previous is not None and not previous.retired:
                 if (previous.binding.owner == owner and previous.binding.run_generation == generation
                         and previous.binding.ticket.dungeon_id == dungeon):
@@ -419,7 +469,8 @@ class RaidRunBridge:
                 group = self._groups.get(ticket.run_id)
                 if group is None or group.raid is not raid or group.ticket is not ticket:
                     raise BridgeError("follower requires this bridge's actual shared ticket")
-            if (ticket.dungeon_id != dungeon or {m.character_id for m in ticket.participants} != set(ids)
+            active_ids = {m.character_id for m in ticket.participants} - group.withdrawn
+            if (ticket.dungeon_id != dungeon or active_ids != set(ids)
                     or owner.character_id in group.records or group.cleared
                     or any(peer.binding.initial_room_key != initial_key for peer in group.records.values())):
                 raise BridgeError("shared entry dungeon/participants changed")
@@ -431,6 +482,32 @@ class RaidRunBridge:
             group.records[owner.character_id] = record
             self._check(record)
             return binding
+
+    def pending_hatchery_participants(self, ticket):
+        with self._lock:
+            group = self._groups.get(ticket.run_id)
+            if group is None or group.ticket is not ticket or group.hatchery_source is None or group.accepted:
+                raise BridgeError('actual pending hatchery ticket required')
+            return tuple(member.character_id for member in ticket.participants
+                         if member.character_id not in group.withdrawn)
+
+    def withdraw_hatchery_members(self, ticket, departures):
+        with self._lock:
+            group = self._groups.get(ticket.run_id)
+            if (group is None or group.ticket is not ticket or group.hatchery_source is None
+                    or group.accepted):
+                return BridgeUpdate()
+            ids = {member.character_id for member in ticket.participants}
+            departed = set(departures) & ids
+            # A live native binding cannot be withdrawn by a stale roster.
+            new = {cid for cid in departed - group.withdrawn
+                   if cid not in group.records or group.records[cid].retired}
+            retained_departures = group.withdrawn | new
+            if new and retained_departures < ids:
+                group.raid.withdraw_pending_hatchery_members(ticket, retained_departures)
+                group.withdrawn.update(new)
+            record = next((record for record in group.records.values() if not record.retired), None)
+            return BridgeUpdate(accepted=record is not None and self._accept_group_if_ready(group, record))
 
     def note_loading_request(self, session, binding):
         """C1/0025 before the ordinary handler; no client boolean is consumed."""
@@ -455,19 +532,30 @@ class RaidRunBridge:
         """Stamp the ordinary loading responses with their sent map cycle."""
         with self._lock:
             record = self._record(session, binding)
-            self._check(record)
             self._loading_room(record)
             if not record.loading_requested:
                 raise BridgeError('loading response has no owned loading request')
+            self._check(record, finish_heart=True)
             return record.loading_cycle
+
+    def room_loading_delivery(self, session, binding, room, *, shared_death=False):
+        """Return the matching visit and whether its native load reply was sent."""
+        with self._lock:
+            record = self._record(session, binding)
+            self._check(record, finish_heart=shared_death)
+            self._room(session, room)
+            if record.loading_room is room:
+                return record.loading_cycle, record.loading_sent == _LOADING
+            return record.loading_cycle + 1, False
 
     def _accept_group_if_ready(self, group, record):
         if group.accepted:
             return False
-        ids = {m.character_id for m in group.ticket.participants}
-        if set(group.records) != ids:
+        ids = {m.character_id for m in group.ticket.participants} - group.withdrawn
+        if not ids or set(group.records) - group.withdrawn != ids:
             return False
-        for peer in group.records.values():
+        for cid in ids:
+            peer = group.records[cid]
             if peer.retired:
                 return False
             self._check(peer)
@@ -487,8 +575,12 @@ class RaidRunBridge:
         """
         with self._lock:
             record = self._record(session, binding)
-            group = self._check(record)
             key = (int(flag), int(opcode))
+            finish_heart = ((key in _SETTLEMENT and request_opcode == 0x002E)
+                            or (key == (0, 0x001F) and request_opcode == 0x0027)
+                            or (key in _LOADING and request_opcode == 0x0025
+                                and loading_cycle is not None and loading_cycle == record.loading_cycle))
+            group = self._check(record, finish_heart=finish_heart)
             if key in _ENTRY:
                 if request_opcode == 0x0010:
                     if key == (0, 0x001D):
@@ -530,11 +622,11 @@ class RaidRunBridge:
                 return self._finish_clear(record, group)
             return BridgeUpdate()
 
-    def note_room_enter(self, session, binding, room_state):
+    def note_room_enter(self, session, binding, room_state, *, shared_death=False):
         """Actual committed room journal after its START_MAP successfully sent."""
         with self._lock:
             record = self._record(session, binding)
-            group = self._check(record)
+            group = self._check(record, finish_heart=shared_death)
             key = self._room(session, room_state)
             if not group.accepted or key not in record.sent_rooms:
                 raise BridgeError("room event requires committed run and actual START_MAP send")
@@ -545,11 +637,41 @@ class RaidRunBridge:
             record.entered_rooms.add(key)
             return True
 
-    def note_actor_death(self, session, binding, actor_row):
+    def accept_volcano_boss_death(self, session, binding, actor_row):
+        """Sample the barrier before the ordinary DIE handler mutates the boss."""
+        with self._lock:
+            record = self._record(session, binding)
+            if not record.raid.uses_volcano_barrier(binding.ticket):
+                return True
+            room = self._room_key(session)
+            boss_cell = (int(getattr(session, 'dungeon_boss_x', -1)), int(getattr(session, 'dungeon_boss_y', -1)))
+            if room[1:3] != boss_cell or int(actor_row.get('type') or actor_row.get('mon_type') or 0) not in (3, 8):
+                return True
+            group = self._check(record)
+            if (not group.accepted or room not in record.sent_rooms
+                    or not any(row is actor_row for row in getattr(session, 'dungeon_room_mons', ()) or ())):
+                raise BridgeError('Volcano barrier check requires its loaded terminal boss row')
+            owner = binding.owner
+            return record.raid.accept_volcano_boss_death(binding.ticket.run_id, owner.character_id,
+                                                        owner.account_id, self._clock())
+
+    def guard_heart_death(self, session, binding, *, shared_death=False):
+        """Only a queued server death may finish a Heart room after phase completion."""
+        with self._lock:
+            record = self._record(session, binding)
+            raid = record.raid
+            if not raid.is_anton_heart(binding.ticket):
+                return
+            battle = raid.advance_clock(self._clock())
+            self._check(record, finish_heart=shared_death)
+            if battle.status == "completed" and not shared_death:
+                raise ExpiredBridgeEvent("completed Heart accepts only an already recorded shared death")
+
+    def note_actor_death(self, session, binding, actor_row, *, shared_death=False):
         """Only the actual current server actor row after accepted 0027 killed it."""
         with self._lock:
             record = self._record(session, binding)
-            group = self._check(record)
+            group = self._check(record, finish_heart=shared_death)
             room_key = self._room_key(session)
             states = getattr(session, "dungeon_room_states", {})
             self._room(session, states.get(room_key))
@@ -655,7 +777,7 @@ class RaidRunBridge:
         # Keep the row alive; Python id reuse cannot alias a later entity.
         group.barrier_deaths[key] = (authority, signature, death.event_id)
 
-    def note_clear_gate(self, session, binding, death, *, condition_state=None):
+    def note_clear_gate(self, session, binding, death, *, condition_state=None, shared_death=False):
         """Inside the real 0027 phase0->1 ENABLE_CLEAR branch, before send.
 
         death is the bridge's opaque actual actor journal, not parsed client data.
@@ -663,7 +785,7 @@ class RaidRunBridge:
         """
         with self._lock:
             record = self._record(session, binding)
-            self._check(record)
+            self._check(record, finish_heart=shared_death)
             if not any(value is death for value in record.deaths.values()) or death.room_key != self._room_key(session):
                 raise BridgeError("clear gate has no actual current owned death journal")
             if int(getattr(session, "dungeon_clear_phase", 0) or 0) != 1:
@@ -686,6 +808,9 @@ class RaidRunBridge:
                 boss_cell = (int(getattr(session, "dungeon_boss_x", -1)), int(getattr(session, "dungeon_boss_y", -1)))
                 if cell != boss_cell and death.actor_type not in (3, 8):
                     raise BridgeError("owned boss endpoint/type or PVF condition required")
+            if (record.raid.uses_volcano_barrier(binding.ticket)
+                    and not record.raid.has_volcano_boss_death(binding.ticket.run_id)):
+                raise BridgeError('Volcano clear gate requires its approved terminal boss death')
             if record.clear_gate is not None:
                 if record.clear_gate is not death:
                     raise BridgeError("clear gate journal changed")
@@ -697,7 +822,9 @@ class RaidRunBridge:
         """Before calling ordinary 002E; False means duplicate, do not re-run it."""
         with self._lock:
             record = self._record(session, binding)
-            self._check(record)
+            if record.raid.is_anton_heart(binding.ticket):
+                record.raid.advance_clock(self._clock())
+            self._check(record, finish_heart=True)
             if record.settlement_guarded:
                 return not record.settlement_prepared and record.settlement_result is not None
             if (record.clear_gate is None or not record.clear_gate_sent
@@ -709,7 +836,7 @@ class RaidRunBridge:
     def settlement_result(self,session,binding,result=None):
         """Cache already committed ordinary effects; retry only response encoding."""
         with self._lock:
-            record=self._record(session,binding);self._check(record)
+            record=self._record(session,binding);self._check(record, finish_heart=True)
             if result is not None:
                 if not record.settlement_guarded or int(getattr(session,'dungeon_clear_phase',0) or 0)!=2:
                     raise BridgeError('only the owned ordinary settled result can be cached')
@@ -720,7 +847,7 @@ class RaidRunBridge:
         """After the protected helper returns; keys are SERVER-built responses."""
         with self._lock:
             record = self._record(session, binding)
-            self._check(record)
+            self._check(record, finish_heart=True)
             if (not record.settlement_guarded or record.clear_gate is None or not record.clear_gate_sent
                     or int(getattr(session, "dungeon_clear_phase", 0) or 0) != 2
                     or not _SETTLEMENT <= set(packet_keys)):
@@ -732,7 +859,7 @@ class RaidRunBridge:
             return BridgeUpdate()
         if record.settlement_sent != _SETTLEMENT:
             return BridgeUpdate()
-        self._check(record)
+        self._check(record, finish_heart=True)
         if int(getattr(record.session, "dungeon_clear_phase", 0) or 0) != 2:
             raise BridgeError("settlement state changed before actual final send")
         binding = record.binding
@@ -744,7 +871,10 @@ class RaidRunBridge:
                                 record.settlement_prepared and record.settlement_sent == _SETTLEMENT)
         changed = False
         if not group.cleared:
-            changed = bool(record.raid.clear(proof, self._clock()))
+            if record.raid.is_anton_heart(binding.ticket):
+                changed = bool(record.raid.clear(proof, self._clock(), finish_heart=True))
+            else:
+                changed = bool(record.raid.clear(proof, self._clock()))
             group.cleared = True
         if self._member_clear is not None:
             self._member_clear(record.raid.family, binding.ticket.phase, proof)

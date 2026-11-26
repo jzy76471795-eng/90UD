@@ -1,6 +1,7 @@
 """C1/0204 dispatches PVF-backed stackable actions used by Stage3."""
 from __future__ import annotations
 
+import sqlite3
 import struct
 from typing import Any
 
@@ -17,10 +18,12 @@ from game.character.damage_font import (
 from game.character.damage_font_index import get_damage_font_index
 from game.character.item_metadata import resolve_item_metadata
 from game.quest.quest_session import resolve_selected_character_detail
+from game.quest.weekly_attendance import ARMOR_VOUCHER, redeem_armor_voucher
 
 
 USE_DAMAGE_FONT_OPCODE = 0x0204
 DAMAGE_FONT_ACTION_TYPE = 0x82
+ARMOR_VOUCHER_ACTION_TYPE = 0x64
 MAIN_LIST_TYPE = 0
 EXTERNAL_CLEAR_TOAST = (
     "正在清空所有主线/外传/系统/成就/个性/时空碎片任务，请耐心等待。"
@@ -42,13 +45,15 @@ _LIVE_ACTION_BY_QUEST_TICKET = {
 def parse_use_damage_font_0204(body: bytes) -> dict[str, int] | None:
     """Parse ``i16 slot, u8 list, u32 instance/action/arg1/arg2`` exactly."""
     raw = bytes(body or b"")
-    if len(raw) != 19:
+    # The native period confirmation uses Noekeon and arrives in two blocks.
+    padded_voucher = len(raw) == 32 and not any(raw[19:])
+    if len(raw) != 19 and not padded_voucher:
         return None
-    slot, list_type, instance, action_type, argument1, argument2 = struct.unpack(
+    slot, list_type, instance, action_type, argument1, argument2 = struct.unpack_from(
         "<hBIIII",
         raw,
     )
-    if slot < 0:
+    if slot < 0 or (padded_voucher and action_type != ARMOR_VOUCHER_ACTION_TYPE):
         return None
     return {
         "slot_index": int(slot),
@@ -75,6 +80,33 @@ def _titlebook_identity(
     )
 
 
+def _try_use_armor_voucher(server, session, request):
+    # The native period-confirmation sender writes the target container and slot
+    # as the last two u32s. The original activity armor lives in Main.
+    if (request["action_type"] != ARMOR_VOUCHER_ACTION_TYPE
+            or request["list_type"] != MAIN_LIST_TYPE or request["instance"] != 0
+            or request["argument1"] != MAIN_LIST_TYPE or not 9 <= request["argument2"] < 0xFFFF
+            or not getattr(session, "enter_seria_settled", False)
+            or getattr(session, "in_dungeon_run", False) or getattr(session, "in_dungeon_select", False)):
+        return None
+    cid = getattr(session, "selected_character_id", None)
+    if type(cid) is not int or cid <= 0:
+        return None
+    repo = server._repo()
+    slot = request["slot_index"]
+    source = repo.get_inventory_item_at(cid, list_type=MAIN_LIST_TYPE, slot_index=slot)
+    if not source or source["item_template_id"] != ARMOR_VOUCHER:
+        return None
+    armor_slot = request["argument2"]
+    try:
+        temporary, permanent = redeem_armor_voucher(server, session, slot, armor_slot)
+    except (ValueError, sqlite3.Error) as exc:
+        return [], f"C1/0204 ARMOR_VOUCHER reject={exc}"
+    refresh, note = build_main_inventory_refresh_packet(server, repo, cid)
+    return [refresh], (f"C1/0204 ARMOR_VOUCHER converted={temporary}:{permanent} "
+                       f"source_slot={slot} armor_slot={armor_slot} action={request['action_type']:#x}; {note}")
+
+
 def handle_use_damage_font_0204(
     server: Any,
     body: bytes,
@@ -84,6 +116,9 @@ def handle_use_damage_font_0204(
     parsed = parse_use_damage_font_0204(body)
     if parsed is None:
         return [], "C1/0204 USE_STACKABLE_ACTION ignored malformed_body"
+    voucher_result = _try_use_armor_voucher(server, session, parsed)
+    if voucher_result is not None:
+        return voucher_result
     # 01A858C0 -> 01A85540: [story book] uses action 0x67 and the
     # PVF quest ID as argument1. It cannot pass the zero-argument gate below.
     if parsed["action_type"] == 0x67:
@@ -146,9 +181,15 @@ def handle_use_damage_font_0204(
             "C1/0204 FATIGUE_USE success item=%d remaining=%d source=%s; %s"
             % (item_id, balance.remaining, metadata.source_path, inventory_note)
         )
+    allow_cn_earring = False
+    if item_id == 10303919:
+        from game.character.cn2018_shop import enabled as cn_shop_enabled
+
+        allow_cn_earring = cn_shop_enabled()
     task_rule = _quest_tickets.QuestCompletionTicketRule.from_action(
         metadata.action_type,
         metadata.action_values,
+        allow_cn_earring=allow_cn_earring,
     )
     if task_rule is not None:
         if bool(getattr(session, "in_dungeon_run", False)):

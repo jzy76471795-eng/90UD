@@ -5,17 +5,17 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import time
-from typing import Callable, Mapping
+from typing import Callable
 
 from game.character.adventure_group import EXPERTISE_CHARACTER_LEVEL, calculate_adventure_group_for_account
 from game.character.character_stats import decode_grow_type
+from game.quest.adventure_season1 import record_game_actions
 from pvf.cn_expedition_index import ALLOW_GROUP_C, EXPEDITION_HOURS, ExpeditionIndex
 
 
 CN_TIME = timezone(timedelta(hours=8))
 RESET_HOUR = 6
 MAX_PARTY = 4
-RewardKey = tuple[int, int, int, int]
 
 
 class ExpeditionRejected(ValueError):
@@ -65,12 +65,10 @@ def expedition_rotation(index: ExpeditionIndex, now: int) -> tuple[int, dict[int
 class CN2018Expedition:
     def __init__(
         self, repo, index: ExpeditionIndex, *,
-        verified_rewards: Mapping[RewardKey, int] | None = None,
         clock: Callable[[], float] = time.time,
     ):
         self.repo = repo
         self.index = index
-        self.verified_rewards = dict(verified_rewards or {})
         self.clock = clock
 
     def _member(self, row) -> ExpeditionMember | None:
@@ -163,10 +161,17 @@ class CN2018Expedition:
             return [
                 {"character_id": member.character_id, "name": member.name, "job": member.job,
                  "branch": member.branch, "expertise_level": ranks.expertise_level_for_exp(member.expertise_exp),
+                 "expertise_exp": member.expertise_exp,
                  "attribute_ids": [self.index.attributes[name] for name in member.attributes],
                  "registered": bool(row["registered"])}
                 for row in rows if (member := self._member(row)) is not None
             ]
+
+    def area_attribute_view(self) -> dict[int, tuple[int, ...]]:
+        """Return the same rotated attributes used by party validation."""
+        _, rotation = expedition_rotation(self.index, int(self.clock()))
+        return {area: tuple(self.index.attributes[attribute] for attribute in attributes)
+                for area, attributes in rotation.items()}
 
     def _area(self, account_id: int, area_id: int):
         area = self.index.areas.get(area_id)
@@ -257,9 +262,9 @@ class CN2018Expedition:
                     raise ExpeditionRejected("expedition_member_attribute_mismatch")
                 coverage |= match
             matched = coverage.bit_count()
-            reward = self.verified_rewards.get((area_id, hours, len(members), matched))
-            if type(reward) is not int or not 0 < reward <= self.index.glory_cap:
-                raise ExpeditionRejected("expedition_reward_unverified")
+            reward = self.index.glory_reward(area_id, hours, len(members), matched)
+            if not 0 < reward <= self.index.glory_cap:
+                raise ExpeditionRejected("expedition_reward_invalid")
             run_id = conn.execute(
                 "INSERT INTO account_cn2018_expedition "
                 "(account_id,request_id,area_id,start_unix,finish_unix,rotation_key,required_attributes,matched_count,"
@@ -270,6 +275,7 @@ class CN2018Expedition:
                 "INSERT INTO account_cn2018_expedition_member (run_id,slot,character_id) VALUES (?,?,?)",
                 [(run_id, slot, cid) for slot, cid in enumerate(members)],
             )
+            record_game_actions(conn, account_id, "expedition_start", (f"cn2018:{run_id}",), now=now)
             return self._run(conn, conn.execute(
                 "SELECT * FROM account_cn2018_expedition WHERE run_id=?", (run_id,),
             ).fetchone(), now)
@@ -324,6 +330,10 @@ class CN2018Expedition:
                     "INSERT INTO account_cn2018_glory (account_id,period_yyyymm,balance) VALUES (?,?,?) "
                     "ON CONFLICT (account_id) DO UPDATE SET period_yyyymm=excluded.period_yyyymm,balance=excluded.balance",
                     (account_id, period, balance + credit),
+                )
+                record_game_actions(
+                    conn, account_id, "glory_crystals_earned",
+                    (f"{run_id}:{unit}" for unit in range(credit)), now=now,
                 )
             conn.execute(
                 "UPDATE account_cn2018_expedition SET status=?,glory_credited=? WHERE account_id=? AND run_id=?",

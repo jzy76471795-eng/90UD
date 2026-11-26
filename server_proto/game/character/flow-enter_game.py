@@ -155,7 +155,8 @@ class GameSessionState:
     dungeon_run_neo_exp: int = 0
     dungeon_run_fatigue_burn_exp: int = 0
     dungeon_run_started_monotonic: float | None = None
-    weekly_attendance_run_id: str | None = None
+    adventure_season1_run: tuple[str, int, int, bool, bool] | None = None
+    weekly_attendance_run: tuple[str, int, int] | None = None
     dungeon_run_play_time_ms: int | None = None
     dungeon_run_best_time_ms: int | None = None
     # Monotonic within this Game TCP.  A linked-dungeon retry is valid only for
@@ -373,7 +374,8 @@ class GameSessionState:
         self.dungeon_run_neo_exp = 0
         self.dungeon_run_fatigue_burn_exp = 0
         self.dungeon_run_started_monotonic = None
-        self.weekly_attendance_run_id = None
+        self.adventure_season1_run = None
+        self.weekly_attendance_run = None
         self.dungeon_run_play_time_ms = None
         self.dungeon_run_best_time_ms = None
         self.dungeon_run_generation = 0

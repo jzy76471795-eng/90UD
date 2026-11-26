@@ -461,6 +461,28 @@ def _c2s_plain_wire_enabled() -> bool:
     )
 
 
+def _is_native_name_body(opcode: int, body: bytes) -> bool:
+    """Recognize the frozen client's length-prefixed names before codec guessing."""
+    if opcode in (0x02B5, 0x0144):
+        name_end = len(body) if opcode == 0x02B5 else len(body) - 1
+        if name_end < 5 or int.from_bytes(body[:4], "little") != name_end - 4:
+            return False
+        if opcode == 0x0144 and body[-1] != 0:
+            return False
+        parsed = parse_check_name_body(body[:name_end])
+        return parsed is not None and parsed[2] == "body"
+    if opcode == 0x0005:
+        parsed = parse_create_character_body(body)
+        return parsed is not None and parsed.source == "body" and len(parsed.body_after_name) == 8
+    if opcode == 0x0087:
+        from game.character.character_rename import parse_change
+        parsed = parse_change(body)
+        return parsed is not None and len(body) == (
+            10 + len(parsed["old_name"].encode("utf-8")) + len(parsed["new_name"].encode("utf-8"))
+        )
+    return False
+
+
 def _s2c_plain_wire_enabled() -> bool:
     """Whether S2C codec responses bypass native client decoding."""
     return _env_bool(
@@ -4448,6 +4470,13 @@ class GameServer:
                             "C2S plain-wire direct body from the client encode hook",
                         )
                         self._log_plain_wire_packet("recv", packet)
+                    elif (header.flag_or_magic == 1 and header.length == 0x0F
+                          and header.opcode in (0x0004, 0x001B, 0x01FE, 0x0578)):
+                        # These stock writers put their u16 argument directly after
+                        # the 13-byte client header on the protected Stage3 client.
+                        decode = DecodeResult(True, header.codec_index,
+                                              game_packet_body(packet, header),
+                                              "compact u16 command body")
                     else:
                         # Important Stage3 wire quirk:
                         #
@@ -4470,7 +4499,10 @@ class GameServer:
                         # ForcePlain 二进制；新功能不得再增加 opcode 白名单。
                         decode = None
                         op = int(header.opcode)
-                        if op == 0x001A and codec_body:
+                        if (header.flag_or_magic == 1 and op in (0x0005, 0x0087, 0x0144, 0x02B5)
+                                and _is_native_name_body(op, codec_body)):
+                            decode = DecodeResult(True, header.codec_index, codec_body, "native UTF-8 name body")
+                        elif op == 0x001A and codec_body:
                             try:
                                 _dj = load_chain("opcode001a-disjoint_item.py")
                                 if _dj.parse_disjoint_item_body(codec_body) is not None:

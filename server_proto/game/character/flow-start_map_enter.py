@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import os
 import time
+import sqlite3
 from typing import Any
 
 from game.quest.initial_quests import (
@@ -57,6 +58,7 @@ from game.quest.initial_quests import (
 from game.quest.daily_challenge import build_daily_challenge_init_0287
 from game.quest.quest_session import hydrate_quest_lists
 from game.character.initial_skills import get_initial_skills_for_job
+from game.quest.adventure_season1 import record_login as record_adventure_season1_login
 from game.character.adventure_group import (
     calculate_adventure_group_for_character,
     record_adventure_group_login,
@@ -113,6 +115,7 @@ from game.shop.cube_contract import (
 from game.shop.cera_booster_wrapper import migrate_cera_booster_wrappers_for_character
 from game.shop.cerashop_index import get_mileage_shop_index
 from game.shop.mileage import (
+    EMPTY_FEATURE_SNAPSHOT,
     MILEAGE_BALANCE_OPCODE,
     MILEAGE_SHOP_EVENT_OPCODE,
     build_mileage_balance,
@@ -398,6 +401,10 @@ class EnterSeriaStartMapService:
                 type(adventure_login_exc).__name__,
                 adventure_login_exc,
             )
+        try:
+            record_adventure_season1_login(repo, int(view.account_id))
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            adventure_login_note += f" season1_error={type(exc).__name__}:{exc}"
         account_cera = repo.get_account_cera(int(view.account_id))
         account_mileage = repo.get_account_mileage(int(view.account_id))
         premium_index = get_premium_contract_index()
@@ -791,8 +798,9 @@ class EnterSeriaStartMapService:
         ]
         mileage_enabled = bool(get_mileage_shop_index())
         local_raid_features = _env_bool("USDOF_LOCAL_RAID_FEATURES", False)
-        if mileage_enabled and not local_raid_features:
-            packets.append(self.server._codec_response(0, MILEAGE_SHOP_EVENT_OPCODE, build_mileage_shop_event()))
+        event_body = build_mileage_shop_event(mileage_enabled=mileage_enabled, raid_enabled=local_raid_features)
+        if not local_raid_features and event_body != EMPTY_FEATURE_SNAPSHOT:
+            packets.append(self.server._codec_response(0, MILEAGE_SHOP_EVENT_OPCODE, event_body))
         notes = [
             f"START_MAP enabled; S{start_flag}/0004 start_game_success plain_len={len(start_body)} "
             f"map_key={map_key} map_key_src={map_key_src} n2_8={n2_8} cid={view.character_id} "
@@ -1170,7 +1178,6 @@ class EnterSeriaStartMapService:
 
         delayed: list[tuple[bytes, str]] = []
         if local_raid_features:
-            event_body = build_mileage_shop_event(mileage_enabled=mileage_enabled, raid_enabled=True)
             delayed.append(
                 (
                     self.server._codec_response(0, MILEAGE_SHOP_EVENT_OPCODE, event_body),

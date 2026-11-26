@@ -123,14 +123,18 @@ public static class PythonClientLauncher
         var exe=Path.Combine(root,"DFO.exe");
         const string cnPath="us_extend_dll/usdof_cn_fix.dll";
         var gameHash=File.Exists(exe)?Sha256(exe):null;
-        if(gameHash is ("0d2da067512bc812d2430afeadb2c13a4d53bd0e7f76801fab228bef52a1ee8e" or "5385a7c47d49517d5834c1c0000d28e363165e411f5ef2079e9e627595883097"))
+        const string combinedGame = "5385a7c47d49517d5834c1c0000d28e363165e411f5ef2079e9e627595883097";
+        if(gameHash is ("0d2da067512bc812d2430afeadb2c13a4d53bd0e7f76801fab228bef52a1ee8e" or combinedGame))
         {
             Add(cnPath,false);
-            var release=gameHash=="5385a7c47d49517d5834c1c0000d28e363165e411f5ef2079e9e627595883097"?"combined-native-compat-20261122":"pinyin-focus-20261120";
+            var release=gameHash==combinedGame?"combined-native-compat-20261122":"pinyin-focus-20261120";
             var expected=pins.RootElement.GetProperty("dlls").EnumerateArray().Single(r=>r.GetProperty("relative_path").GetString()==cnPath)
                 .GetProperty("approved_variants").EnumerateArray().Where(r=>
-                    r.GetProperty("release").GetString()==release ||
-                    r.GetProperty("release").GetString()==release+"-player-logs");
+                {
+                    var pinnedRelease = r.GetProperty("release").GetString();
+                    return pinnedRelease == release || pinnedRelease == release + "-player-logs" ||
+                        (gameHash == combinedGame && (pinnedRelease is "chat-hotkey-focus-20261125" or "chat-cn-native-return-20261126" or "chat-cn-preedit-release-20261126" or "unicode-packet-frame-20261126"));
+                });
             var cn=PythonUpdateTrust.Within(root,cnPath);
             var length=new FileInfo(cn).Length;
             var sha=Sha256(cn);
@@ -146,6 +150,20 @@ public static class PythonClientLauncher
             foreach(var file in Directory.GetFiles(external,"*.dll").OrderBy(p=>p,StringComparer.OrdinalIgnoreCase))
                 Add("us_extend_dll/"+Path.GetFileName(file),true);
         return paths;
+    }
+
+    private static string LaunchComponent(string runtime, string component)
+    {
+        const string embeddedName = "usdof_game_assist.dll";
+        if (!Path.GetFileName(component).Equals(embeddedName, StringComparison.OrdinalIgnoreCase))
+            return component;
+        using var resource = Assembly.GetExecutingAssembly().GetManifestResourceStream("DNFLogin.Resources." + embeddedName);
+        if (resource is null) return component;
+        var target = Path.Combine(runtime, embeddedName);
+        using var output = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.Read);
+        resource.CopyTo(output);
+        output.Flush(true);
+        return target;
     }
 
     private static string Extract(string directory,string resource)
@@ -169,7 +187,7 @@ public static class PythonClientLauncher
         var psi=new ProcessStartInfo(injector){UseShellExecute=false,CreateNoWindow=true,WorkingDirectory=plan.Root,RedirectStandardOutput=true,RedirectStandardError=true};
         psi.ArgumentList.Add("--exe");psi.ArgumentList.Add(plan.Exe);psi.ArgumentList.Add("--workdir");psi.ArgumentList.Add(plan.Root);
         if(helper is not null){psi.ArgumentList.Add("--dll");psi.ArgumentList.Add(helper);}
-        foreach(var dll in plan.Dlls){psi.ArgumentList.Add("--dll");psi.ArgumentList.Add(dll);}
+        foreach(var dll in plan.Dlls){psi.ArgumentList.Add("--dll");psi.ArgumentList.Add(LaunchComponent(runtime,dll));}
         psi.ArgumentList.Add("--args");psi.ArgumentList.Add(session.Stage.LaunchArgument);
         foreach(var name in psi.Environment.Keys.ToArray())if(name.StartsWith("USDOF_",StringComparison.OrdinalIgnoreCase)||name.StartsWith("DNF_REMOTE_",StringComparison.OrdinalIgnoreCase)||name.StartsWith("DNF_PYTHON_",StringComparison.OrdinalIgnoreCase)||name=="DNF_PVF_KEYSET")psi.Environment.Remove(name);
         var logDirectory=LauncherPackage.ConfigurationDirectory;
@@ -180,6 +198,16 @@ public static class PythonClientLauncher
         foreach(var name in new[]{"TEMP","TMP","TMPDIR"})psi.Environment[name]=temp;
         var sidechannels=new Dictionary<string,string>{["USDOF_NATIVE_LOADOUT_PLAN_PATH"]="USDOFLoadoutNativePlan.bin",["USDOF_NATIVE_LOADOUT_ACK_PATH"]="USDOFLoadoutNativeAck.bin",["USDOF_NATIVE_LOADOUT_THREAD_PATH"]="USDOFNativeLoadoutThread.bin",["USDOF_FUNC_EXTEND_TOAST_REQUEST_PATH"]="USDOFFuncExtendToastRequest.bin",["USDOF_FUNC_EXTEND_THREAD_PATH"]="USDOFFuncExtendThread.bin",["USDOF_FUNC_EXTEND_VIDEO_COMMAND_PATH"]="USDOFFuncExtendVideoCommand.bin"};
         foreach(var pair in sidechannels)psi.Environment[pair.Key]=Path.Combine(temp,pair.Value);
+        var adventureExtension = plan.Dlls.FirstOrDefault(dll =>
+            string.Equals(Path.GetFileName(dll), "cn2018_adventure_statistics.dll", StringComparison.OrdinalIgnoreCase));
+        var weeklyExtension = plan.Dlls.FirstOrDefault(dll =>
+            string.Equals(Path.GetFileName(dll), "usdof_weekly_attendance.dll", StringComparison.OrdinalIgnoreCase));
+        bool trustedAdventure = adventureExtension is not null &&
+            Sha256(adventureExtension) is ("5dd8f5c6795d49a3f0b82b6a35bfe85889c963203641b9fa904f06a8eb8912c1" or "3b689027a581834f967bb8d4aa43b869f4771b7cc0db49daf77c36f841565c5d");
+        bool trustedAttendance = weeklyExtension is not null && Sha256(weeklyExtension) == "0cababd13083deb5c23cc25a11916e2fcd5436a87270147f19d10397af1f439f";
+        string? adventurePipe = trustedAdventure || trustedAttendance
+            ? "USDOF-Adventure-" + Guid.NewGuid().ToString("N") : null;
+        if (adventurePipe is not null) psi.Environment["USDOF_ADVENTURE_PIPE"] = adventurePipe;
         foreach(var pair in new Dictionary<string,string>{["__COMPAT_LAYER"]="DPIUNAWARE",["USDOF_CLIENT_DIR"]=plan.Root,["USDOF_CLIENT_EXE"]=plan.Exe,["USDOF_PVF_PATH"]=plan.Pvf,["USDOF_EXPECTED_PVF_PROFILE"]=session.Stage.PvfProfile,["USDOF_EXPECTED_PVF_SHA256"]=session.Stage.PvfSha256,["USDOF_PVF_BRIDGE"]=session.Stage.PvfProfile=="utility-guarded"?"1":"0",["USDOF_SKIP_PVF_STARTUP_PREPROCESS"]="1",["USDOF_FUNC_EXTEND_VIDEO"]="1",["USDOF_FUNC_EXTEND_VIDEO_HOOK"]="1",["USDOF_GAME_PLAIN_WIRE"]="0",["USDOF_GAME_C2S_PLAIN_WIRE"]="1",["USDOF_GAME_S2C_PLAIN_WIRE"]="0",["USDOF_GAME_PLAIN_WIRE_HEADER"]="16"})psi.Environment[pair.Key]=pair.Value;
         psi.Environment["USDOF_GAME_PROBE_IPV4"]=session.Stage.ChannelHost;
         psi.Environment["DNF_PYTHON_CLIENT_CODE_KEY"]=ClientCodeProtection.CodeKey();
@@ -230,6 +258,7 @@ public static class PythonClientLauncher
             process.Exited+=(_,_)=>{ownedRelay?.Dispose();ownedRoute.Dispose();};
             process.EnableRaisingEvents=true;
             if(process.HasExited)throw new InvalidOperationException("游戏进程已提前退出。");
+            if (adventurePipe is not null) _ = PythonAdventurePipe.RunAsync(adventurePipe, process, session);
             channelRoute=null; // The game's exit now owns this idempotent lease.
             relay=null;
             startedGame=null;

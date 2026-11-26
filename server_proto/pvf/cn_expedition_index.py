@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 import math
+import struct
 from threading import Lock
 from types import MappingProxyType
 from typing import Mapping
@@ -16,6 +17,10 @@ ADVENTURER_2018_PATH = "etc/adventurersystem/adventurersystem2018.etc"
 EXPEDITION_HOURS = (6, 12, 18, 24)
 ALLOW_GROUP_C = "[group c allow]"
 COLLECTION_JOB_IDS = {f"[{name}]": job for job, name in enumerate((*CHARACTER_JOB_LABELS, "gun blader"))}
+
+
+def _float32(value: float) -> float:
+    return struct.unpack("<f", struct.pack("<f", value))[0]
 
 
 @dataclass(frozen=True)
@@ -46,6 +51,14 @@ class ExpeditionIndex:
         if required == ALLOW_GROUP_C:
             return any(attribute in actual for attribute in self.groups["[group c]"])
         return required in actual
+
+    def glory_reward(self, area_id: int, hours: int, party_size: int, matched_attributes: int) -> int:
+        """Use the calculation displayed by the supplied CN expedition confirmation."""
+        coefficient = self.areas[area_id].reward_coefficients[EXPEDITION_HOURS.index(hours)]
+        party_reward = _float32(self.party_rates[party_size] * coefficient)
+        matched_reward = _float32(self.attribute_rates[matched_attributes] * party_reward)
+        rounded_reward = int(_float32(matched_reward + 0.5))
+        return int(_float32(rounded_reward * self.extra_rate))
 
 
 def _section(lines: list[str], tag: str) -> list[str]:

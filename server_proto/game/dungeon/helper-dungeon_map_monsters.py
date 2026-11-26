@@ -1741,12 +1741,10 @@ def load_map_monsters(
     # Map passive sections are client-owned static geometry by default.  Only a
     # matching active hunt-enemy(type=3) task may turn one into a wire actor.
     rows.extend(
-        select_task_controlled_passive_objects(
-            passive_rows,
-            active_quest_ids=active_quest_ids,
-            dungeon_id=dungeon_id,
-            difficulty=difficulty,
-        )
+        dict(row, personal_quest_actor=True)
+        for row in select_task_controlled_passive_objects(
+            passive_rows, active_quest_ids=active_quest_ids,
+            dungeon_id=dungeon_id, difficulty=difficulty)
     )
 
     limit = _env_int("USDOF_DUNGEON_MONSTER_LIMIT", 0)
@@ -1828,6 +1826,7 @@ def load_map_monsters(
                 "extra_state": int(extra_state) & 0xFFFFFFFF,
                 "extra_flag": 0,
                 "quest_enemy_type": quest_enemy,
+                "personal_quest_actor": bool(row.get("personal_quest_actor")),
                 "is_scene_dummy": is_scene_dummy,
                 "is_blocking": is_blocking,
                 "grants_exp": bool(row.get("grants_exp", kind == "monster" and is_hostile)),

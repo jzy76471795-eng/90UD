@@ -345,6 +345,12 @@ def note_local_send(server, session, packet, profile_receipt=None):
         if value is packet and index not in previous[1]:
             previous[1].add(index)
             break
+    projection = pending[1]
+    projection.note_visible_write(packet)
+    if entry.family == 'anton' and projection.active_state_packet is packet:
+        # Retain the actual notice write across a scene change even when other
+        # packets in this batch still need to be sent.
+        projection.native_state = pending[2][0]
     if len(previous[1]) == len(batch):
         adapter.projection_sent(entry, batch, session)
         session._raid_projection_sent = None

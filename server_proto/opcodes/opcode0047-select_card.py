@@ -19,6 +19,7 @@ S2C CMD opcode=71 读者 ``sub_15F6D20``（``sub_15FDAA0`` 注册）::
 from __future__ import annotations
 
 import os
+import sqlite3
 from typing import Any
 
 from game.chain_loader import load_chain
@@ -37,6 +38,7 @@ from game.dungeon.clear_reward import (
     ORDINARY_CARD_LAYOUT,
     ORDINARY_PAID_CARD_REWARD_MULTIPLIER,
 )
+from game.quest.adventure_season1 import record_golden_card
 
 _payloads = load_chain("helper-dungeon_payloads.py")
 build_select_card_ack_0047_stage3 = _payloads.build_select_card_ack_0047_stage3
@@ -627,6 +629,13 @@ class SelectCard0047Service:
             except Exception as exc:
                 paid_callback = False
                 notes.append("deliver_paid err=%r" % (exc,))
+
+        if paid_callback and plan.get("card_layout") == ORDINARY_CARD_LAYOUT:
+            try:
+                if record_golden_card(self.server, session):
+                    notes.append("adventure_season1_gold_card=1")
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                notes.append("adventure_season1_gold_card_error=%s" % type(exc).__name__)
 
         # CMD 成功前缀后才是 record 0。上/下四的具体牌位由客户端本地点击
         # 状态决定；最后 8 个 player_status 必须保持清零。
